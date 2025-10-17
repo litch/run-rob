@@ -44,6 +44,9 @@ struct MotorState {
     lock_mode: bool,
     available_actuators: Vec<u8>,
     last_scan_time: Option<std::time::Instant>,
+    current_kp: f32,
+    current_kd: f32,
+    current_max_torque: f32,
 }
 
 impl MotorState {
@@ -70,6 +73,9 @@ impl MotorState {
             lock_mode: false,
             available_actuators: Vec::new(),
             last_scan_time: None,
+            current_kp: 0.0,
+            current_kd: 0.0,
+            current_max_torque: 0.0,
         }
     }
 
@@ -267,10 +273,13 @@ async fn run_tui(
             };
             
             supervisor.configure(actuator_id, cfg.clone()).await?;
+            motor_state.current_kp = cfg.kp;
+            motor_state.current_kd = cfg.kd;
+            motor_state.current_max_torque = cfg.max_torque.unwrap_or(0.0);
             current_lock_mode = motor_state.lock_mode;
-            info!("Lock mode {}: kp={}, kd={}", 
+            info!("Lock mode {}: kp={}, kd={}, max_torque={}", 
                   if motor_state.lock_mode { "ENABLED" } else { "DISABLED" },
-                  cfg.kp, cfg.kd);
+                  cfg.kp, cfg.kd, cfg.max_torque.unwrap_or(0.0));
         }
         
         // Update motor feedback at regular intervals
@@ -448,6 +457,14 @@ async fn run_tui(
                     Span::styled("Temperature:       ", Style::default().fg(Color::Yellow)),
                     Span::styled(format!("{:5.1} °C", motor_state.current_temperature), Style::default().fg(temp_color)),
                 ]),
+                Line::from(""),
+                Line::from(vec![
+                    Span::styled("Control Config:    ", Style::default().fg(Color::Yellow)),
+                    Span::styled(format!("kp={:.1}  kd={:.1}  max_torque={:.1} Nm", 
+                        motor_state.current_kp, motor_state.current_kd, motor_state.current_max_torque), 
+                        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+                ]),
+                Line::from(""),
                 Line::from(vec![
                     Span::styled("Faults: ", Style::default().fg(Color::Yellow)),
                     Span::styled(if has_faults { "ACTIVE" } else { "None" }, 
@@ -523,13 +540,17 @@ async fn run_tui(
                     Span::styled("Tab", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
                     Span::raw("  Cycle increment    "),
                     Span::styled("0", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
-                    Span::raw("    Zero position"),
+                    Span::raw("    Zero target"),
+                ]),
+                Line::from(vec![
+                    Span::styled("Z", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+                    Span::raw("    Re-zero motor      "),
+                    Span::styled("L", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+                    Span::raw("    Toggle Lock"),
                 ]),
                 Line::from(vec![
                     Span::styled("←/→", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
-                    Span::raw("  Switch actuator    "),
-                    Span::styled("L", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
-                    Span::raw("    Toggle Lock"),
+                    Span::raw("  Switch actuator"),
                 ]),
                 Line::from(vec![
                     Span::styled("Q/Esc", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
@@ -561,6 +582,12 @@ async fn run_tui(
                         }
                         KeyCode::Char('0') => {
                             motor_state.zero_position();
+                        }
+                        KeyCode::Char('z') | KeyCode::Char('Z') => {
+                            // Re-zero the motor (set current position as zero)
+                            let _ = supervisor.zero(actuator_id).await;
+                            motor_state.target_position = 0.0;
+                            info!("Re-zeroed actuator {}", actuator_id);
                         }
                         KeyCode::Char('l') | KeyCode::Char('L') => {
                             motor_state.toggle_lock_mode();
