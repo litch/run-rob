@@ -27,8 +27,13 @@ struct MotorState {
     current_position: f32,
     current_velocity: f32,
     current_torque: f32,
-    current_voltage: f32,
     current_temperature: f32,
+    fault_uncalibrated: bool,
+    fault_hall_encoding: bool,
+    fault_magnetic_encoding: bool,
+    fault_over_temperature: bool,
+    fault_overcurrent: bool,
+    fault_undervoltage: bool,
     increment: f32,
     increment_index: usize,
     feedback_received: bool,
@@ -37,6 +42,8 @@ struct MotorState {
     feedback_count: u64,
     motor_enabled: bool,
     lock_mode: bool,
+    available_actuators: Vec<u8>,
+    last_scan_time: Option<std::time::Instant>,
 }
 
 impl MotorState {
@@ -46,8 +53,13 @@ impl MotorState {
             current_position: 0.0,
             current_velocity: 0.0,
             current_torque: 0.0,
-            current_voltage: 0.0,
             current_temperature: 0.0,
+            fault_uncalibrated: false,
+            fault_hall_encoding: false,
+            fault_magnetic_encoding: false,
+            fault_over_temperature: false,
+            fault_overcurrent: false,
+            fault_undervoltage: false,
             increment: 0.01,
             increment_index: 1,
             feedback_received: false,
@@ -56,6 +68,8 @@ impl MotorState {
             feedback_count: 0,
             motor_enabled: false,
             lock_mode: false,
+            available_actuators: Vec::new(),
+            last_scan_time: None,
         }
     }
 
@@ -115,7 +129,22 @@ async fn main() -> eyre::Result<()> {
         }
     });
 
-    let actuator_id = 1;
+    // Scan for available actuators first
+    info!("Scanning for available actuators...");
+    let actuator_configs = vec![
+        (1, ActuatorConfiguration { actuator_type: ActuatorType::RobStride00, ..Default::default() }),
+        (2, ActuatorConfiguration { actuator_type: ActuatorType::RobStride00, ..Default::default() }),
+        (3, ActuatorConfiguration { actuator_type: ActuatorType::RobStride00, ..Default::default() }),
+        (127, ActuatorConfiguration { actuator_type: ActuatorType::RobStride00, ..Default::default() }),
+    ];
+    
+    let available_actuators = supervisor.scan_bus(0xFE, "socketcan", &actuator_configs).await?;
+    info!("Found {} actuators: {:?}", available_actuators.len(), available_actuators);
+    
+    // Use first available actuator, or default to 1
+    let actuator_id = *available_actuators.first().unwrap_or(&1);
+    info!("Auto-connecting to actuator {}", actuator_id);
+    
     supervisor.add_actuator(
         Box::new(RobStride00::new(
             actuator_id,
@@ -128,7 +157,7 @@ async fn main() -> eyre::Result<()> {
         },
     ).await;
 
-    info!("Enabling the actuator 1");
+    info!("Enabling the actuator {}", actuator_id);
 
     let cfg = ControlConfig {
         kp: 24.0,
@@ -190,12 +219,31 @@ async fn run_tui(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     motor_state: &mut MotorState,
     supervisor: &mut Supervisor,
-    actuator_id: u8,
+    mut actuator_id: u8,
 ) -> eyre::Result<()> {
     let mut last_update = std::time::Instant::now();
     let mut current_lock_mode = motor_state.lock_mode;
+    let mut current_actuator_index = 0usize;
     
     loop {
+        // Scan for available actuators every 5 seconds
+        if motor_state.last_scan_time.is_none() || 
+           motor_state.last_scan_time.unwrap().elapsed() >= Duration::from_secs(5) {
+            // Scan bus for actuators
+            let actuator_configs = vec![
+                (1, ActuatorConfiguration { actuator_type: ActuatorType::RobStride00, ..Default::default() }),
+                (2, ActuatorConfiguration { actuator_type: ActuatorType::RobStride00, ..Default::default() }),
+                (3, ActuatorConfiguration { actuator_type: ActuatorType::RobStride00, ..Default::default() }),
+                (127, ActuatorConfiguration { actuator_type: ActuatorType::RobStride00, ..Default::default() }),
+            ];
+            
+            if let Ok(found_actuators) = supervisor.scan_bus(0xFE, "socketcan", &actuator_configs).await {
+                motor_state.available_actuators = found_actuators;
+                motor_state.last_scan_time = Some(std::time::Instant::now());
+                info!("Scanned bus, found {} actuators: {:?}", motor_state.available_actuators.len(), motor_state.available_actuators);
+            }
+        }
+        
         // Check if lock mode changed and update motor configuration
         if current_lock_mode != motor_state.lock_mode {
             let cfg = if motor_state.lock_mode {
@@ -231,17 +279,25 @@ async fn run_tui(
                 motor_state.current_position = feedback.angle;
                 motor_state.current_velocity = feedback.velocity;
                 motor_state.current_torque = feedback.torque;
-                motor_state.current_voltage = 0.0; // Voltage not available in feedback
                 motor_state.current_temperature = feedback.temperature;
+                motor_state.fault_uncalibrated = feedback.fault_uncalibrated;
+                motor_state.fault_hall_encoding = feedback.fault_hall_encoding;
+                motor_state.fault_magnetic_encoding = feedback.fault_magnetic_encoding;
+                motor_state.fault_over_temperature = feedback.fault_over_temperature;
+                motor_state.fault_overcurrent = feedback.fault_overcurrent;
+                motor_state.fault_undervoltage = feedback.fault_undervoltage;
                 motor_state.feedback_received = true;
                 motor_state.last_feedback_time = Some(std::time::Instant::now());
                 motor_state.feedback_count += 1;
                 
-                // Log feedback to help debug why motor isn't moving
+                // Log all feedback fields to help debug
                 if motor_state.feedback_count % 20 == 0 {
-                    info!("Feedback #{}: pos={:.4}, vel={:.4}, torque={:.4}, temp={:.1}", 
+                    info!("Feedback #{}: angle={:.4}, vel={:.4}, torque={:.4}, temp={:.1}, faults=[uncal:{}, hall:{}, mag:{}, temp:{}, curr:{}, volt:{}]", 
                           motor_state.feedback_count, feedback.angle, feedback.velocity, 
-                          feedback.torque, feedback.temperature);
+                          feedback.torque, feedback.temperature,
+                          feedback.fault_uncalibrated, feedback.fault_hall_encoding,
+                          feedback.fault_magnetic_encoding, feedback.fault_over_temperature,
+                          feedback.fault_overcurrent, feedback.fault_undervoltage);
                 }
             } else {
                 motor_state.feedback_received = false;
@@ -264,7 +320,7 @@ async fn run_tui(
                 .constraints([
                     Constraint::Length(3),
                     Constraint::Length(8),
-                    Constraint::Length(10),
+                    Constraint::Length(20),
                     Constraint::Length(8),
                     Constraint::Min(5),
                 ])
@@ -300,6 +356,22 @@ async fn run_tui(
                 ("NORMAL", Color::Green)
             };
 
+            // Format available actuators list
+            let actuators_str = if motor_state.available_actuators.is_empty() {
+                "Scanning...".to_string()
+            } else {
+                motor_state.available_actuators.iter()
+                    .map(|id| {
+                        if *id == actuator_id {
+                            format!("[{}]", id)  // Highlight current actuator
+                        } else {
+                            format!("{}", id)
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            };
+
             let connection_text = vec![
                 Line::from(vec![
                     Span::styled("Connection: ", Style::default().fg(Color::Yellow)),
@@ -322,9 +394,14 @@ async fn run_tui(
                     Span::styled("Last Feedback: ", Style::default().fg(Color::Yellow)),
                     Span::styled(format!("{}ms ago", feedback_age), 
                         Style::default().fg(if feedback_age < 100 { Color::Green } else if feedback_age < 500 { Color::Yellow } else { Color::Red })),
-                    Span::raw("  |  "),
-                    Span::styled("Motor ID: ", Style::default().fg(Color::Yellow)),
-                    Span::styled(format!("{}", actuator_id), Style::default().fg(Color::Cyan)),
+                ]),
+                Line::from(vec![
+                    Span::styled("Active Actuator: ", Style::default().fg(Color::Yellow)),
+                    Span::styled(format!("{}", actuator_id), Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+                ]),
+                Line::from(vec![
+                    Span::styled("Available Actuators: ", Style::default().fg(Color::Yellow)),
+                    Span::styled(actuators_str, Style::default().fg(Color::Green)),
                 ]),
             ];
             
@@ -341,9 +418,13 @@ async fn run_tui(
                 Color::Green
             };
             
+            let has_faults = motor_state.fault_uncalibrated || motor_state.fault_hall_encoding || 
+                            motor_state.fault_magnetic_encoding || motor_state.fault_over_temperature ||
+                            motor_state.fault_overcurrent || motor_state.fault_undervoltage;
+            
             let status_text = vec![
                 Line::from(vec![
-                    Span::styled("Target Position:   ", Style::default().fg(Color::Yellow)),
+                    Span::styled("Target pPosition:   ", Style::default().fg(Color::Yellow)),
                     Span::styled(format!("{:8.4} rad ({:7.2}°)", motor_state.target_position, motor_state.target_position.to_degrees()), Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
                 ]),
                 Line::from(vec![
@@ -366,6 +447,38 @@ async fn run_tui(
                 Line::from(vec![
                     Span::styled("Temperature:       ", Style::default().fg(Color::Yellow)),
                     Span::styled(format!("{:5.1} °C", motor_state.current_temperature), Style::default().fg(temp_color)),
+                ]),
+                Line::from(vec![
+                    Span::styled("Faults: ", Style::default().fg(Color::Yellow)),
+                    Span::styled(if has_faults { "ACTIVE" } else { "None" }, 
+                        Style::default().fg(if has_faults { Color::Red } else { Color::Green }).add_modifier(Modifier::BOLD)),
+                ]),
+                Line::from(vec![
+                    Span::styled("  Uncalibrated:    ", Style::default().fg(Color::Gray)),
+                    Span::styled(if motor_state.fault_uncalibrated { "YES" } else { "no" }, 
+                        Style::default().fg(if motor_state.fault_uncalibrated { Color::Red } else { Color::DarkGray })),
+                    Span::raw("  "),
+                    Span::styled("Hall Enc:    ", Style::default().fg(Color::Gray)),
+                    Span::styled(if motor_state.fault_hall_encoding { "YES" } else { "no" }, 
+                        Style::default().fg(if motor_state.fault_hall_encoding { Color::Red } else { Color::DarkGray })),
+                ]),
+                Line::from(vec![
+                    Span::styled("  Magnetic Enc:    ", Style::default().fg(Color::Gray)),
+                    Span::styled(if motor_state.fault_magnetic_encoding { "YES" } else { "no" }, 
+                        Style::default().fg(if motor_state.fault_magnetic_encoding { Color::Red } else { Color::DarkGray })),
+                    Span::raw("  "),
+                    Span::styled("Over Temp:   ", Style::default().fg(Color::Gray)),
+                    Span::styled(if motor_state.fault_over_temperature { "YES" } else { "no" }, 
+                        Style::default().fg(if motor_state.fault_over_temperature { Color::Red } else { Color::DarkGray })),
+                ]),
+                Line::from(vec![
+                    Span::styled("  Overcurrent:     ", Style::default().fg(Color::Gray)),
+                    Span::styled(if motor_state.fault_overcurrent { "YES" } else { "no" }, 
+                        Style::default().fg(if motor_state.fault_overcurrent { Color::Red } else { Color::DarkGray })),
+                    Span::raw("  "),
+                    Span::styled("Undervolt:   ", Style::default().fg(Color::Gray)),
+                    Span::styled(if motor_state.fault_undervoltage { "YES" } else { "no" }, 
+                        Style::default().fg(if motor_state.fault_undervoltage { Color::Red } else { Color::DarkGray })),
                 ]),
                 Line::from(""),
                 Line::from(vec![
@@ -413,8 +526,12 @@ async fn run_tui(
                     Span::raw("    Zero position"),
                 ]),
                 Line::from(vec![
+                    Span::styled("←/→", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+                    Span::raw("  Switch actuator    "),
                     Span::styled("L", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
-                    Span::raw("    Toggle Lock Mode   "),
+                    Span::raw("    Toggle Lock"),
+                ]),
+                Line::from(vec![
                     Span::styled("Q/Esc", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
                     Span::raw("  Quit"),
                 ]),
@@ -447,6 +564,100 @@ async fn run_tui(
                         }
                         KeyCode::Char('l') | KeyCode::Char('L') => {
                             motor_state.toggle_lock_mode();
+                        }
+                        KeyCode::Left => {
+                            // Switch to previous actuator
+                            if !motor_state.available_actuators.is_empty() {
+                                if current_actuator_index == 0 {
+                                    current_actuator_index = motor_state.available_actuators.len() - 1;
+                                } else {
+                                    current_actuator_index -= 1;
+                                }
+                                let new_actuator_id = motor_state.available_actuators[current_actuator_index];
+                                if new_actuator_id != actuator_id {
+                                    // Disable current actuator
+                                    let _ = supervisor.disable(actuator_id, false).await;
+                                    
+                                    // Switch to new actuator
+                                    actuator_id = new_actuator_id;
+                                    
+                                    // Add and enable new actuator if not already added
+                                    supervisor.add_actuator(
+                                        Box::new(RobStride00::new(
+                                            actuator_id,
+                                            0xFE,
+                                            supervisor.get_transport_tx("socketcan").await.unwrap(),
+                                        )),
+                                        ActuatorConfiguration {
+                                            actuator_type: ActuatorType::RobStride00,
+                                            ..Default::default()
+                                        },
+                                    ).await;
+                                    
+                                    let cfg = ControlConfig {
+                                        kp: 24.0,
+                                        kd: 0.6,
+                                        max_torque: Some(100.0),
+                                        max_velocity: Some(50.0),
+                                        max_current: Some(10.0),
+                                    };
+                                    let _ = supervisor.configure(actuator_id, cfg).await;
+                                    let _ = supervisor.enable(actuator_id).await;
+                                    
+                                    // Reset motor state for new actuator
+                                    motor_state.target_position = 0.0;
+                                    motor_state.feedback_received = false;
+                                    motor_state.command_count = 0;
+                                    motor_state.feedback_count = 0;
+                                    
+                                    info!("Switched to actuator {}", actuator_id);
+                                }
+                            }
+                        }
+                        KeyCode::Right => {
+                            // Switch to next actuator
+                            if !motor_state.available_actuators.is_empty() {
+                                current_actuator_index = (current_actuator_index + 1) % motor_state.available_actuators.len();
+                                let new_actuator_id = motor_state.available_actuators[current_actuator_index];
+                                if new_actuator_id != actuator_id {
+                                    // Disable current actuator
+                                    let _ = supervisor.disable(actuator_id, false).await;
+                                    
+                                    // Switch to new actuator
+                                    actuator_id = new_actuator_id;
+                                    
+                                    // Add and enable new actuator if not already added
+                                    supervisor.add_actuator(
+                                        Box::new(RobStride00::new(
+                                            actuator_id,
+                                            0xFE,
+                                            supervisor.get_transport_tx("socketcan").await.unwrap(),
+                                        )),
+                                        ActuatorConfiguration {
+                                            actuator_type: ActuatorType::RobStride00,
+                                            ..Default::default()
+                                        },
+                                    ).await;
+                                    
+                                    let cfg = ControlConfig {
+                                        kp: 24.0,
+                                        kd: 0.6,
+                                        max_torque: Some(100.0),
+                                        max_velocity: Some(50.0),
+                                        max_current: Some(10.0),
+                                    };
+                                    let _ = supervisor.configure(actuator_id, cfg).await;
+                                    let _ = supervisor.enable(actuator_id).await;
+                                    
+                                    // Reset motor state for new actuator
+                                    motor_state.target_position = 0.0;
+                                    motor_state.feedback_received = false;
+                                    motor_state.command_count = 0;
+                                    motor_state.feedback_count = 0;
+                                    
+                                    info!("Switched to actuator {}", actuator_id);
+                                }
+                            }
                         }
                         _ => {}
                     }
