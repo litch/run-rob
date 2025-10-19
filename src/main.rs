@@ -165,12 +165,13 @@ async fn main() -> eyre::Result<()> {
 
     info!("Enabling the actuator {}", actuator_id);
 
+    // Start with high stiffness configuration
     let cfg = ControlConfig {
-        kp: 24.0,
-        kd: 0.6,
-        max_torque: Some(100.0),
-        max_velocity: Some(50.0),
-        max_current: Some(10.0), 
+        kp: 150.0,
+        kd: 8.0,
+        max_torque: Some(150.0),
+        max_velocity: Some(80.0),
+        max_current: Some(100.0), 
     };
     supervisor.configure(actuator_id, cfg.clone()).await?;
     supervisor.enable(actuator_id).await?;
@@ -253,22 +254,22 @@ async fn run_tui(
         // Check if lock mode changed and update motor configuration
         if current_lock_mode != motor_state.lock_mode {
             let cfg = if motor_state.lock_mode {
-                // Lock mode: High stiffness for resisting perturbations
+                // Lock mode: MAXIMUM stiffness - lock it down hard
                 ControlConfig {
-                    kp: 80.0,  // Much higher position gain
-                    kd: 2.0,   // Higher damping
-                    max_torque: Some(100.0),
-                    max_velocity: Some(50.0),
-                    max_current: Some(90.0),
+                    kp: 200.0,  // Maximum position gain
+                    kd: 10.0,   // Maximum damping
+                    max_torque: Some(200.0),  // Maximum torque
+                    max_velocity: Some(100.0),
+                    max_current: Some(100.0),  // Maximum current
                 }
             } else {
-                // Normal mode: Original settings
+                // Normal mode: High stiffness (much stiffer than before)
                 ControlConfig {
-                    kp: 90.0,
-                    kd: 5.0,
-                    max_torque: Some(100.0),
-                    max_velocity: Some(50.0),
-                    max_current: Some(90.0),
+                    kp: 150.0,  // Very high position gain
+                    kd: 8.0,    // High damping
+                    max_torque: Some(150.0),
+                    max_velocity: Some(80.0),
+                    max_current: Some(100.0),
                 }
             };
             
@@ -388,8 +389,9 @@ async fn run_tui(
                     Span::raw("  |  "),
                     Span::styled("Motor: ", Style::default().fg(Color::Yellow)),
                     Span::styled(motor_status.0, Style::default().fg(motor_status.1).add_modifier(Modifier::BOLD)),
-                    Span::raw("  |  "),
-                    Span::styled("Mode: ", Style::default().fg(Color::Yellow)),
+                ]),
+                Line::from(vec![
+                    Span::styled("Lock Mode: ", Style::default().fg(Color::Yellow)),
                     Span::styled(lock_status.0, Style::default().fg(lock_status.1).add_modifier(Modifier::BOLD)),
                 ]),
                 Line::from(vec![
