@@ -59,8 +59,8 @@ Or run the compiled binary directly:
 | `←` | Switch to previous actuator in the list |
 | `→` | Switch to next actuator in the list |
 | `Tab` | Cycle through available increments (0.001, 0.01, 0.1) |
-| `0` | Reset target position to zero |
-| `Z` | Re-zero motor (set current position as zero) |
+| `0` | Set zero point (calibrate current position as zero) |
+| `Z` | Return to zero position |
 | `L` | Toggle Lock Mode (high stiffness) |
 | `Q` or `Esc` | Quit application (safely disables motor) |
 
@@ -175,6 +175,7 @@ candump -tz -x can0
 
 - **Multiple Motors**: The app automatically discovers all motors on the bus. Use ← and → to switch between them.
 - **Lock Mode**: Use Lock Mode (press `L`) when you need the motor to resist external forces with high stiffness.
-- **Re-zeroing**: If a motor's zero position seems off, press `Z` to set the current position as the new zero.
+- **Calibration**: Press `0` to set the motor's current physical position as the new zero point. This is useful for calibrating the motor's home position.
+- **Return to Zero**: Press `Z` to command the motor to move back to the zero position.
 - **Diagnostics**: Check the fault indicators if a motor behaves unexpectedly. Temperature and torque readings help identify mechanical issues.
 - **Logging**: Check `./logs/motor-control.log.*` for detailed diagnostic information if something goes wrong.

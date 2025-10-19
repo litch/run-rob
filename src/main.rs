@@ -97,7 +97,7 @@ impl MotorState {
         self.target_position -= self.increment;
     }
 
-    fn zero_position(&mut self) {
+    fn set_target_zero(&mut self) {
         self.target_position = 0.0;
     }
 
@@ -540,11 +540,11 @@ async fn run_tui(
                     Span::styled("Tab", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
                     Span::raw("  Cycle increment    "),
                     Span::styled("0", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
-                    Span::raw("    Zero target"),
+                    Span::raw("    Set zero point"),
                 ]),
                 Line::from(vec![
                     Span::styled("Z", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
-                    Span::raw("    Re-zero motor      "),
+                    Span::raw("    Return to zero     "),
                     Span::styled("L", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
                     Span::raw("    Toggle Lock"),
                 ]),
@@ -581,13 +581,14 @@ async fn run_tui(
                             motor_state.cycle_increment();
                         }
                         KeyCode::Char('0') => {
-                            motor_state.zero_position();
-                        }
-                        KeyCode::Char('z') | KeyCode::Char('Z') => {
-                            // Re-zero the motor (set current position as zero)
+                            // Set current position as zero (calibration)
                             let _ = supervisor.zero(actuator_id).await;
                             motor_state.target_position = 0.0;
-                            info!("Re-zeroed actuator {}", actuator_id);
+                            info!("Set zero point for actuator {}", actuator_id);
+                        }
+                        KeyCode::Char('z') | KeyCode::Char('Z') => {
+                            // Command motor to return to zero position
+                            motor_state.set_target_zero();
                         }
                         KeyCode::Char('l') | KeyCode::Char('L') => {
                             motor_state.toggle_lock_mode();
