@@ -1,6 +1,6 @@
 use run_rob::{
     MotorState, ControlPresets, scan_actuators, update_motor_state,
-    send_position_command, apply_control_config,
+    send_position_command, apply_control_config, record_episode,
 };
 use robstride::{
     robstride00::RobStride00, ActuatorConfiguration, ActuatorType,
@@ -38,6 +38,12 @@ struct SetPositionRequest {
 #[derive(Debug, Deserialize)]
 struct IncrementRequest {
     amount: f32,
+}
+
+/// Request body for recording episode
+#[derive(Debug, Deserialize)]
+struct RecordRequest {
+    duration_secs: f32,
 }
 
 /// Response for status endpoint
@@ -160,6 +166,7 @@ async fn main() -> eyre::Result<()> {
         .route("/api/lock", post(toggle_lock))
         .route("/api/enable", post(enable_motor))
         .route("/api/disable", post(disable_motor))
+        .route("/api/record", post(record_episode_handler))
         .layer(CorsLayer::permissive())
         .with_state(state);
 
@@ -340,4 +347,31 @@ async fn disable_motor(State(state): State<Arc<AppState>>) -> impl IntoResponse 
     motor_state.motor_enabled = false;
     info!("Disabled actuator {}", actuator_id);
     (StatusCode::OK, format!("Disabled actuator {}", actuator_id))
+}
+
+/// POST /api/record - Record motor data for specified duration
+async fn record_episode_handler(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<RecordRequest>,
+) -> impl IntoResponse {
+    let actuator_id = *state.current_actuator.read().await;
+    let mut supervisor = state.supervisor.write().await;
+    let mut motor_state = state.motor_state.write().await;
+
+    info!("Starting recording for {} seconds", req.duration_secs);
+
+    match record_episode(&mut supervisor, &mut motor_state, actuator_id, req.duration_secs).await {
+        Ok(episode) => {
+            info!("Recording complete: {} samples", episode.data_points.len());
+            (StatusCode::OK, Json(episode)).into_response()
+        }
+        Err(e) => {
+            error!("Failed to record episode: {}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to record episode: {}", e),
+            )
+                .into_response()
+        }
+    }
 }

@@ -161,6 +161,59 @@ Disable the motor.
 curl -X POST http://localhost:8080/api/disable
 ```
 
+### Recording
+
+#### `POST /api/record`
+Record motor data for a specified duration at 100 Hz sampling rate. Returns complete dataset with position, velocity, torque, temperature, and fault data.
+
+**Request Body:**
+```json
+{
+  "duration_secs": 5.0
+}
+```
+
+**Response:**
+```json
+{
+  "actuator_id": 1,
+  "duration_ms": 5003,
+  "sample_rate_hz": 99.8,
+  "control_config": {
+    "kp": 150.0,
+    "kd": 8.0,
+    "max_torque": 150.0,
+    "lock_mode": false
+  },
+  "data_points": [
+    {
+      "timestamp_ms": 0,
+      "target_position": 0.0,
+      "current_position": 0.0,
+      "current_velocity": 0.0,
+      "current_torque": 0.0,
+      "current_temperature": 25.0,
+      "fault_uncalibrated": false,
+      "fault_hall_encoding": false,
+      "fault_magnetic_encoding": false,
+      "fault_over_temperature": false,
+      "fault_overcurrent": false,
+      "fault_undervoltage": false
+    },
+    ...
+  ]
+}
+```
+
+**Example:**
+```bash
+curl -X POST http://localhost:8080/api/record \
+  -H "Content-Type: application/json" \
+  -d '{"duration_secs": 5.0}'
+```
+
+**Note:** This endpoint blocks for the duration of the recording. The motor continues to maintain its target position during recording.
+
 ## Control Parameters
 
 The API uses the same control presets as the TUI:
@@ -174,6 +227,7 @@ The API uses the same control presets as the TUI:
 
 ```python
 import requests
+import json
 
 API_URL = "http://localhost:8080"
 
@@ -190,6 +244,15 @@ requests.post(f"{API_URL}/api/position/increment", json={"amount": 0.1})
 
 # Enable lock mode
 requests.post(f"{API_URL}/api/lock")
+
+# Record 5 seconds of data
+response = requests.post(f"{API_URL}/api/record", json={"duration_secs": 5.0})
+episode = response.json()
+print(f"Recorded {len(episode['data_points'])} samples at {episode['sample_rate_hz']:.1f} Hz")
+
+# Save to file
+with open('recording.json', 'w') as f:
+    json.dump(episode, f, indent=2)
 ```
 
 ### JavaScript Example
