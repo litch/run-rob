@@ -3,13 +3,39 @@ name = "run-rob"
 version = "0.1.0"
 edition = "2024"
 
+[lib]
+name = "run_rob"
+path = "src/lib.rs"
+
+[[bin]]
+name = "run-rob-tui"
+path = "src/bin/tui.rs"
+
+[[bin]]
+name = "run-rob-api"
+path = "src/bin/api.rs"
+
 [dependencies]
 anyhow = "1.0.100"
 eyre = "0.6.12"
 robstride = "0.3.6"
-tokio = "1.47.1"
+tokio = { version = "1.47.1", features = ["full"] }
 tracing = "0.1.41"
 tracing-subscriber = "0.3.20"
 tracing-appender = "0.2"
-ratatui = "0.28"
-crossterm = "0.28"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# TUI dependencies
+ratatui = { version = "0.28", optional = true }
+crossterm = { version = "0.28", optional = true }
+
+# API dependencies
+axum = { version = "0.7", optional = true }
+tower = { version = "0.4", optional = true }
+tower-http = { version = "0.5", features = ["cors"], optional = true }
+
+[features]
+default = ["tui", "api"]
+tui = ["ratatui", "crossterm"]
+api = ["axum", "tower", "tower-http"]

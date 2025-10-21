@@ -1,6 +1,6 @@
-# RobStride Motor Controller TUI
+# RobStride Motor Controller
 
-An interactive terminal user interface (TUI) for controlling RobStride motors with real-time feedback, multi-actuator support, and comprehensive diagnostics.
+Control RobStride motors via an interactive TUI or HTTP/JSON API. Supports real-time feedback, multi-actuator management, and comprehensive diagnostics.
 
 ## Features
 
@@ -38,17 +38,33 @@ An interactive terminal user interface (TUI) for controlling RobStride motors wi
 
 ## Usage
 
-Run the application:
+### Terminal UI (TUI)
+
+Run the interactive terminal interface:
 
 ```bash
-cargo run --release
+cargo run --release --bin run-rob-tui
 ```
 
-Or run the compiled binary directly:
+Or run the compiled binary:
 
 ```bash
-./target/release/run-rob
+./target/release/run-rob-tui
 ```
+
+### HTTP/JSON API
+
+Run the API server (listens on `http://0.0.0.0:8080`):
+
+```bash
+cargo run --release --bin run-rob-api
+```
+
+See [API.md](API.md) for complete API documentation and examples.
+
+### Running Both
+
+You can run both the TUI and API simultaneously in separate terminals to control motors via both interfaces.
 
 ## Keyboard Controls
 
