@@ -10,7 +10,7 @@ sudo pkill slcand || true
 sudo ip link set can0 down 2>/dev/null || true
 
 # Start slcand
-echo "Starting slcand on /dev/ttyACM1..."
+echo "Starting slcand on /dev/ttyACM0..."
 sudo slcand -o -s8 -t hw /dev/ttyACM0 can0
 
 # Give it a moment to initialize

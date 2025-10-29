@@ -188,6 +188,7 @@ Record motor data for a specified duration at 100 Hz sampling rate. Returns comp
   "data_points": [
     {
       "timestamp_ms": 0,
+      "timestamp_utc_micros": 1729531200000000,
       "target_position": 0.0,
       "current_position": 0.0,
       "current_velocity": 0.0,
@@ -212,7 +213,11 @@ curl -X POST http://localhost:8080/api/record \
   -d '{"duration_secs": 5.0}'
 ```
 
-**Note:** This endpoint blocks for the duration of the recording. The motor continues to maintain its target position during recording.
+**Note:** 
+- This endpoint blocks for the duration of the recording
+- The motor maintains its current target position (no position commands are sent during recording)
+- `timestamp_ms` is relative to recording start (0-based)
+- `timestamp_utc_micros` is absolute UTC time in microseconds since Unix epoch
 
 ## Control Parameters
 

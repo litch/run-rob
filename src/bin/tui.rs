@@ -130,11 +130,14 @@ async fn run_tui(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     motor_state: &mut MotorState,
     supervisor: &mut Supervisor,
-    mut actuator_id: u8,
+    actuator_id: u8,
 ) -> eyre::Result<()> {
     let mut last_update = std::time::Instant::now();
     let mut current_lock_mode = motor_state.lock_mode;
-    let mut current_actuator_index = 0usize;
+    
+    // Track motor states for both motors
+    let mut motor_states: Vec<MotorState> = vec![MotorState::new(), MotorState::new()];
+    let mut motors: Vec<u8> = Vec::new();
     
     loop {
         // Scan for available actuators every 5 seconds
@@ -149,9 +152,41 @@ async fn run_tui(
             ];
             
             if let Ok(found_actuators) = supervisor.scan_bus(0xFE, "socketcan", &actuator_configs).await {
-                motor_state.available_actuators = found_actuators;
+                motor_state.available_actuators = found_actuators.clone();
                 motor_state.last_scan_time = Some(std::time::Instant::now());
                 info!("Scanned bus, found {} actuators: {:?}", motor_state.available_actuators.len(), motor_state.available_actuators);
+                
+                // Initialize motors array if we have actuators
+                if motors.is_empty() && found_actuators.len() >= 2 {
+                    motors = found_actuators;
+                    
+                    // Initialize both motors
+                    for (idx, &motor_id) in motors.iter().enumerate().take(2) {
+                        supervisor.add_actuator(
+                            Box::new(RobStride00::new(
+                                motor_id,
+                                0xFE,
+                                supervisor.get_transport_tx("socketcan").await?,
+                            )),
+                            ActuatorConfiguration {
+                                actuator_type: ActuatorType::RobStride00,
+                                ..Default::default()
+                            },
+                        ).await;
+                        
+                        let cfg = ControlPresets::normal_mode();
+                        supervisor.configure(motor_id, cfg.clone()).await?;
+                        supervisor.enable(motor_id).await?;
+                        supervisor.zero(motor_id).await?;
+                        
+                        motor_states[idx].motor_enabled = true;
+                        motor_states[idx].current_kp = cfg.kp;
+                        motor_states[idx].current_kd = cfg.kd;
+                        motor_states[idx].current_max_torque = cfg.max_torque.unwrap_or(0.0);
+                        
+                        info!("Initialized motor {} (motors[{}])", motor_id, idx);
+                    }
+                }
             }
         }
         
@@ -162,19 +197,34 @@ async fn run_tui(
         }
         
         // Update motor feedback at regular intervals
-        if last_update.elapsed() >= Duration::from_millis(50) {
-            update_motor_state(supervisor, motor_state, actuator_id).await?;
+        if last_update.elapsed() >= Duration::from_millis(50) && motors.len() >= 2 {
+            // Update both motors
+            for (idx, &motor_id) in motors.iter().enumerate().take(2) {
+                update_motor_state(supervisor, &mut motor_states[idx], motor_id).await?;
                 
-            // Log all feedback fields to help debug
-            if motor_state.feedback_count % 20 == 0 {
-                info!("Feedback #{}: angle={:.4}, vel={:.4}, torque={:.4}, temp={:.1}", 
-                      motor_state.feedback_count, motor_state.current_position, 
-                      motor_state.current_velocity, motor_state.current_torque, 
-                      motor_state.current_temperature);
+                // Log feedback periodically
+                if motor_states[idx].feedback_count % 20 == 0 {
+                    info!("Motor {} (motors[{}]) Feedback #{}: angle={:.4}, vel={:.4}, torque={:.4}", 
+                          motor_id, idx, motor_states[idx].feedback_count, 
+                          motor_states[idx].current_position, 
+                          motor_states[idx].current_velocity, 
+                          motor_states[idx].current_torque);
+                }
+                
+                // Send position command
+                send_position_command(supervisor, &mut motor_states[idx], motor_id).await?;
             }
             
-            // Send position command
-            send_position_command(supervisor, motor_state, actuator_id).await?;
+            // Update display state with tilt motor (motors[0]) info
+            if motors.len() >= 1 {
+                motor_state.current_position = motor_states[0].current_position;
+                motor_state.current_velocity = motor_states[0].current_velocity;
+                motor_state.current_torque = motor_states[0].current_torque;
+                motor_state.current_temperature = motor_states[0].current_temperature;
+                motor_state.feedback_received = motor_states[0].feedback_received;
+                motor_state.feedback_count = motor_states[0].feedback_count;
+            }
+            
             last_update = std::time::Instant::now();
         }
 
@@ -186,9 +236,9 @@ async fn run_tui(
                 .constraints([
                     Constraint::Length(3),
                     Constraint::Length(8),
-                    Constraint::Length(20),
+                    Constraint::Min(15),
                     Constraint::Length(8),
-                    Constraint::Min(5),
+                    Constraint::Length(7),
                 ])
                 .split(f.area());
 
@@ -276,95 +326,83 @@ async fn run_tui(
                 .block(Block::default().borders(Borders::ALL).title("Connection & Diagnostics"));
             f.render_widget(connection, chunks[1]);
 
-            // Motor Status
-            let temp_color = if motor_state.current_temperature > 60.0 {
-                Color::Red
-            } else if motor_state.current_temperature > 50.0 {
-                Color::Yellow
-            } else {
-                Color::Green
+            // Motor Status - Split into two columns
+            let motor_columns = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+                .split(chunks[2]);
+            
+            // Helper function to create motor status text
+            let create_motor_status = |state: &MotorState, motor_id: u8, _motor_name: &str| {
+                let temp_color = if state.current_temperature > 60.0 {
+                    Color::Red
+                } else if state.current_temperature > 50.0 {
+                    Color::Yellow
+                } else {
+                    Color::Green
+                };
+                
+                let has_faults = state.fault_uncalibrated || state.fault_hall_encoding || 
+                                state.fault_magnetic_encoding || state.fault_over_temperature ||
+                                state.fault_overcurrent || state.fault_undervoltage;
+                
+                vec![
+                    Line::from(vec![
+                        Span::styled(format!("ID: {}", motor_id), Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+                    ]),
+                    Line::from(vec![
+                        Span::styled("Target:  ", Style::default().fg(Color::Yellow)),
+                        Span::styled(format!("{:6.3} rad", state.target_position), Style::default().fg(Color::Green)),
+                    ]),
+                    Line::from(vec![
+                        Span::styled("Current: ", Style::default().fg(Color::Yellow)),
+                        Span::styled(format!("{:6.3} rad", state.current_position), Style::default().fg(Color::White)),
+                    ]),
+                    Line::from(vec![
+                        Span::styled("Error:   ", Style::default().fg(Color::Yellow)),
+                        Span::styled(format!("{:6.3} rad", state.target_position - state.current_position), Style::default().fg(Color::Red)),
+                    ]),
+                    Line::from(""),
+                    Line::from(vec![
+                        Span::styled("Vel:  ", Style::default().fg(Color::Yellow)),
+                        Span::styled(format!("{:6.3} rad/s", state.current_velocity), Style::default().fg(Color::White)),
+                    ]),
+                    Line::from(vec![
+                        Span::styled("Torq: ", Style::default().fg(Color::Yellow)),
+                        Span::styled(format!("{:6.3} Nm", state.current_torque), Style::default().fg(Color::White)),
+                    ]),
+                    Line::from(vec![
+                        Span::styled("Temp: ", Style::default().fg(Color::Yellow)),
+                        Span::styled(format!("{:4.1} °C", state.current_temperature), Style::default().fg(temp_color)),
+                    ]),
+                    Line::from(""),
+                    Line::from(vec![
+                        Span::styled("Faults: ", Style::default().fg(Color::Yellow)),
+                        Span::styled(if has_faults { "YES" } else { "None" }, 
+                            Style::default().fg(if has_faults { Color::Red } else { Color::Green })),
+                    ]),
+                    Line::from(vec![
+                        Span::styled("Feedback: ", Style::default().fg(Color::Yellow)),
+                        Span::styled(format!("{}", state.feedback_count), Style::default().fg(Color::Cyan)),
+                    ]),
+                ]
             };
             
-            let has_faults = motor_state.fault_uncalibrated || motor_state.fault_hall_encoding || 
-                            motor_state.fault_magnetic_encoding || motor_state.fault_over_temperature ||
-                            motor_state.fault_overcurrent || motor_state.fault_undervoltage;
+            // Render tilt motor (motors[0])
+            if motors.len() >= 1 {
+                let tilt_status = create_motor_status(&motor_states[0], motors[0], "TILT");
+                let tilt_widget = Paragraph::new(tilt_status)
+                    .block(Block::default().borders(Borders::ALL).title("TILT Motor (↑/↓)"));
+                f.render_widget(tilt_widget, motor_columns[0]);
+            }
             
-            let status_text = vec![
-                Line::from(vec![
-                    Span::styled("Target pPosition:   ", Style::default().fg(Color::Yellow)),
-                    Span::styled(format!("{:8.4} rad ({:7.2}°)", motor_state.target_position, motor_state.target_position.to_degrees()), Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
-                ]),
-                Line::from(vec![
-                    Span::styled("Current Position:  ", Style::default().fg(Color::Yellow)),
-                    Span::styled(format!("{:8.4} rad ({:7.2}°)", motor_state.current_position, motor_state.current_position.to_degrees()), Style::default().fg(Color::White)),
-                ]),
-                Line::from(vec![
-                    Span::styled("Position Error:    ", Style::default().fg(Color::Yellow)),
-                    Span::styled(format!("{:8.4} rad ({:7.2}°)", motor_state.target_position - motor_state.current_position, (motor_state.target_position - motor_state.current_position).to_degrees()), Style::default().fg(Color::Red)),
-                ]),
-                Line::from(""),
-                Line::from(vec![
-                    Span::styled("Velocity:          ", Style::default().fg(Color::Yellow)),
-                    Span::styled(format!("{:8.4} rad/s", motor_state.current_velocity), Style::default().fg(Color::White)),
-                ]),
-                Line::from(vec![
-                    Span::styled("Torque:            ", Style::default().fg(Color::Yellow)),
-                    Span::styled(format!("{:8.4} Nm", motor_state.current_torque), Style::default().fg(Color::White)),
-                ]),
-                Line::from(vec![
-                    Span::styled("Temperature:       ", Style::default().fg(Color::Yellow)),
-                    Span::styled(format!("{:5.1} °C", motor_state.current_temperature), Style::default().fg(temp_color)),
-                ]),
-                Line::from(""),
-                Line::from(vec![
-                    Span::styled("Control Config:    ", Style::default().fg(Color::Yellow)),
-                    Span::styled(format!("kp={:.1}  kd={:.1}  max_torque={:.1} Nm", 
-                        motor_state.current_kp, motor_state.current_kd, motor_state.current_max_torque), 
-                        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
-                ]),
-                Line::from(""),
-                Line::from(vec![
-                    Span::styled("Faults: ", Style::default().fg(Color::Yellow)),
-                    Span::styled(if has_faults { "ACTIVE" } else { "None" }, 
-                        Style::default().fg(if has_faults { Color::Red } else { Color::Green }).add_modifier(Modifier::BOLD)),
-                ]),
-                Line::from(vec![
-                    Span::styled("  Uncalibrated:    ", Style::default().fg(Color::Gray)),
-                    Span::styled(if motor_state.fault_uncalibrated { "YES" } else { "no" }, 
-                        Style::default().fg(if motor_state.fault_uncalibrated { Color::Red } else { Color::DarkGray })),
-                    Span::raw("  "),
-                    Span::styled("Hall Enc:    ", Style::default().fg(Color::Gray)),
-                    Span::styled(if motor_state.fault_hall_encoding { "YES" } else { "no" }, 
-                        Style::default().fg(if motor_state.fault_hall_encoding { Color::Red } else { Color::DarkGray })),
-                ]),
-                Line::from(vec![
-                    Span::styled("  Magnetic Enc:    ", Style::default().fg(Color::Gray)),
-                    Span::styled(if motor_state.fault_magnetic_encoding { "YES" } else { "no" }, 
-                        Style::default().fg(if motor_state.fault_magnetic_encoding { Color::Red } else { Color::DarkGray })),
-                    Span::raw("  "),
-                    Span::styled("Over Temp:   ", Style::default().fg(Color::Gray)),
-                    Span::styled(if motor_state.fault_over_temperature { "YES" } else { "no" }, 
-                        Style::default().fg(if motor_state.fault_over_temperature { Color::Red } else { Color::DarkGray })),
-                ]),
-                Line::from(vec![
-                    Span::styled("  Overcurrent:     ", Style::default().fg(Color::Gray)),
-                    Span::styled(if motor_state.fault_overcurrent { "YES" } else { "no" }, 
-                        Style::default().fg(if motor_state.fault_overcurrent { Color::Red } else { Color::DarkGray })),
-                    Span::raw("  "),
-                    Span::styled("Undervolt:   ", Style::default().fg(Color::Gray)),
-                    Span::styled(if motor_state.fault_undervoltage { "YES" } else { "no" }, 
-                        Style::default().fg(if motor_state.fault_undervoltage { Color::Red } else { Color::DarkGray })),
-                ]),
-                Line::from(""),
-                Line::from(vec![
-                    Span::styled("Current Increment: ", Style::default().fg(Color::Yellow)),
-                    Span::styled(format!("{:.4} rad", motor_state.increment), Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD)),
-                ]),
-            ];
-            
-            let status = Paragraph::new(status_text)
-                .block(Block::default().borders(Borders::ALL).title("Motor Status"));
-            f.render_widget(status, chunks[2]);
+            // Render pan motor (motors[1])
+            if motors.len() >= 2 {
+                let pan_status = create_motor_status(&motor_states[1], motors[1], "PAN");
+                let pan_widget = Paragraph::new(pan_status)
+                    .block(Block::default().borders(Borders::ALL).title("PAN Motor (←/→)"));
+                f.render_widget(pan_widget, motor_columns[1]);
+            }
 
             // Available Increments
             let increments = MotorState::get_increments();
@@ -389,10 +427,12 @@ async fn run_tui(
             // Controls
             let controls_text = vec![
                 Line::from(vec![
-                    Span::styled("↑/W", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
-                    Span::raw("  Increase position  "),
-                    Span::styled("↓/S", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
-                    Span::raw("  Decrease position"),
+                    Span::styled("↑/↓", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+                    Span::raw("  Control TILT motor (motors[0])  "),
+                ]),
+                Line::from(vec![
+                    Span::styled("←/→", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+                    Span::raw("  Control PAN motor (motors[1])"),
                 ]),
                 Line::from(vec![
                     Span::styled("Tab", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
@@ -405,10 +445,6 @@ async fn run_tui(
                     Span::raw("    Return to zero     "),
                     Span::styled("L", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
                     Span::raw("    Toggle Lock"),
-                ]),
-                Line::from(vec![
-                    Span::styled("←/→", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
-                    Span::raw("  Switch actuator"),
                 ]),
                 Line::from(vec![
                     Span::styled("Q/Esc", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
@@ -429,109 +465,59 @@ async fn run_tui(
                         KeyCode::Char('q') | KeyCode::Char('Q') | KeyCode::Esc => {
                             break;
                         }
-                        KeyCode::Up | KeyCode::Char('w') | KeyCode::Char('W') => {
-                            motor_state.increase_position();
+                        KeyCode::Up => {
+                            // Control tilt motor (motors[0])
+                            if motors.len() >= 1 {
+                                motor_states[0].increase_position();
+                                info!("Tilt motor (motors[0], ID {}): target={:.4}", motors[0], motor_states[0].target_position);
+                            }
                         }
-                        KeyCode::Down | KeyCode::Char('s') | KeyCode::Char('S') => {
-                            motor_state.decrease_position();
-                        }
-                        KeyCode::Tab => {
-                            motor_state.cycle_increment();
-                        }
-                        KeyCode::Char('0') => {
-                            // Set current position as zero (calibration)
-                            let _ = supervisor.zero(actuator_id).await;
-                            motor_state.target_position = 0.0;
-                            info!("Set zero point for actuator {}", actuator_id);
-                        }
-                        KeyCode::Char('z') | KeyCode::Char('Z') => {
-                            // Command motor to return to zero position
-                            motor_state.set_target_zero();
-                        }
-                        KeyCode::Char('l') | KeyCode::Char('L') => {
-                            motor_state.toggle_lock_mode();
+                        KeyCode::Down => {
+                            // Control tilt motor (motors[0])
+                            if motors.len() >= 1 {
+                                motor_states[0].decrease_position();
+                                info!("Tilt motor (motors[0], ID {}): target={:.4}", motors[0], motor_states[0].target_position);
+                            }
                         }
                         KeyCode::Left => {
-                            // Switch to previous actuator
-                            if !motor_state.available_actuators.is_empty() {
-                                if current_actuator_index == 0 {
-                                    current_actuator_index = motor_state.available_actuators.len() - 1;
-                                } else {
-                                    current_actuator_index -= 1;
-                                }
-                                let new_actuator_id = motor_state.available_actuators[current_actuator_index];
-                                if new_actuator_id != actuator_id {
-                                    // Disable current actuator
-                                    let _ = supervisor.disable(actuator_id, false).await;
-                                    
-                                    // Switch to new actuator
-                                    actuator_id = new_actuator_id;
-                                    
-                                    // Add and enable new actuator if not already added
-                                    supervisor.add_actuator(
-                                        Box::new(RobStride00::new(
-                                            actuator_id,
-                                            0xFE,
-                                            supervisor.get_transport_tx("socketcan").await.unwrap(),
-                                        )),
-                                        ActuatorConfiguration {
-                                            actuator_type: ActuatorType::RobStride00,
-                                            ..Default::default()
-                                        },
-                                    ).await;
-                                    
-                                    let cfg = ControlPresets::normal_mode();
-                                    let _ = supervisor.configure(actuator_id, cfg).await;
-                                    let _ = supervisor.enable(actuator_id).await;
-                                    
-                                    // Reset motor state for new actuator
-                                    motor_state.target_position = 0.0;
-                                    motor_state.feedback_received = false;
-                                    motor_state.command_count = 0;
-                                    motor_state.feedback_count = 0;
-                                    
-                                    info!("Switched to actuator {}", actuator_id);
-                                }
+                            // Control pan motor (motors[1])
+                            if motors.len() >= 2 {
+                                motor_states[1].decrease_position();
+                                info!("Pan motor (motors[1], ID {}): target={:.4}", motors[1], motor_states[1].target_position);
                             }
                         }
                         KeyCode::Right => {
-                            // Switch to next actuator
-                            if !motor_state.available_actuators.is_empty() {
-                                current_actuator_index = (current_actuator_index + 1) % motor_state.available_actuators.len();
-                                let new_actuator_id = motor_state.available_actuators[current_actuator_index];
-                                if new_actuator_id != actuator_id {
-                                    // Disable current actuator
-                                    let _ = supervisor.disable(actuator_id, false).await;
-                                    
-                                    // Switch to new actuator
-                                    actuator_id = new_actuator_id;
-                                    
-                                    // Add and enable new actuator if not already added
-                                    supervisor.add_actuator(
-                                        Box::new(RobStride00::new(
-                                            actuator_id,
-                                            0xFE,
-                                            supervisor.get_transport_tx("socketcan").await.unwrap(),
-                                        )),
-                                        ActuatorConfiguration {
-                                            actuator_type: ActuatorType::RobStride00,
-                                            ..Default::default()
-                                        },
-                                    ).await;
-                                    
-                                    let cfg = ControlPresets::normal_mode();
-                                    let _ = supervisor.configure(actuator_id, cfg).await;
-                                    let _ = supervisor.enable(actuator_id).await;
-                                    
-                                    // Reset motor state for new actuator
-                                    motor_state.target_position = 0.0;
-                                    motor_state.feedback_received = false;
-                                    motor_state.command_count = 0;
-                                    motor_state.feedback_count = 0;
-                                    
-                                    info!("Switched to actuator {}", actuator_id);
-                                }
+                            // Control pan motor (motors[1])
+                            if motors.len() >= 2 {
+                                motor_states[1].increase_position();
+                                info!("Pan motor (motors[1], ID {}): target={:.4}", motors[1], motor_states[1].target_position);
                             }
+                        }
+                        KeyCode::Tab => {
+                            // Cycle increment for both motors
+                            motor_states[0].cycle_increment();
+                            motor_states[1].cycle_increment();
+                            motor_state.increment = motor_states[0].increment;
+                            motor_state.increment_index = motor_states[0].increment_index;
+                        }
+                        KeyCode::Char('0') => {
+                            // Set current position as zero for both motors
+                            if motors.len() >= 2 {
+                                let _ = supervisor.zero(motors[0]).await;
+                                let _ = supervisor.zero(motors[1]).await;
+                                motor_states[0].target_position = 0.0;
+                                motor_states[1].target_position = 0.0;
+                                info!("Set zero point for both motors");
+                            }
+                        }
+                        KeyCode::Char('z') | KeyCode::Char('Z') => {
+                            // Command both motors to return to zero position
+                            motor_states[0].set_target_zero();
+                            motor_states[1].set_target_zero();
+                            info!("Returning both motors to zero");
+                        }
+                        KeyCode::Char('l') | KeyCode::Char('L') => {
+                            motor_state.toggle_lock_mode();
                         }
                         _ => {}
                     }

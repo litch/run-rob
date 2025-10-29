@@ -3,7 +3,7 @@ use robstride::{
     ActuatorConfiguration, ActuatorType, ControlConfig, Supervisor,
 };
 use serde::{Deserialize, Serialize};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tracing::info;
 
 /// Shared motor state that can be used by both TUI and API
@@ -222,6 +222,7 @@ pub async fn apply_control_config(
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RecordingDataPoint {
     pub timestamp_ms: u64,
+    pub timestamp_utc_micros: i64,
     pub target_position: f32,
     pub current_position: f32,
     pub current_velocity: f32,
@@ -274,12 +275,16 @@ pub async fn record_episode(
         // Update motor state
         update_motor_state(supervisor, motor_state, actuator_id).await?;
         
-        // Send position command
-        send_position_command(supervisor, motor_state, actuator_id).await?;
+        // Get UTC timestamp in microseconds
+        let utc_micros = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_micros() as i64;
         
         // Record data point
         let data_point = RecordingDataPoint {
             timestamp_ms: start_time.elapsed().as_millis() as u64,
+            timestamp_utc_micros: utc_micros,
             target_position: motor_state.target_position,
             current_position: motor_state.current_position,
             current_velocity: motor_state.current_velocity,
