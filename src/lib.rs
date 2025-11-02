@@ -1,12 +1,15 @@
 use eyre::Result;
 use robstride::{
-    ActuatorConfiguration, ActuatorType, ControlConfig, Supervisor,
+    ActuatorConfiguration, ActuatorType, ControlConfig, FeedbackFrame, Supervisor,
 };
 use serde::{Deserialize, Serialize};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::Instant;
 use tracing::info;
 
-/// Shared motor state that can be used by both TUI and API
+const MOVING_VELOCITY_THRESHOLD: f32 = 0.01;
+
+
+/// Shared motor state that can be used by both TUI and API, and Bus
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MotorState {
     pub target_position: f32,
@@ -20,8 +23,6 @@ pub struct MotorState {
     pub fault_over_temperature: bool,
     pub fault_overcurrent: bool,
     pub fault_undervoltage: bool,
-    pub increment: f32,
-    pub increment_index: usize,
     pub feedback_received: bool,
     #[serde(skip)]
     pub last_feedback_time: Option<Instant>,
@@ -35,6 +36,15 @@ pub struct MotorState {
     pub current_kp: f32,
     pub current_kd: f32,
     pub current_max_torque: f32,
+    pub state: MotorStates,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum MotorStates {
+    IDLE,
+    MOVING,
+    LOCKED,
+    FAULT,
 }
 
 impl MotorState {
@@ -51,8 +61,6 @@ impl MotorState {
             fault_over_temperature: false,
             fault_overcurrent: false,
             fault_undervoltage: false,
-            increment: 0.01,
-            increment_index: 1,
             feedback_received: false,
             last_feedback_time: None,
             command_count: 0,
@@ -64,29 +72,16 @@ impl MotorState {
             current_kp: 0.0,
             current_kd: 0.0,
             current_max_torque: 0.0,
+            state: MotorStates::IDLE,
         }
     }
 
-    pub fn get_increments() -> [f32; 3] {
-        [0.001, 0.01, 0.1]
+    pub fn set_position(&mut self, position: f32) {
+        self.target_position = position;
     }
 
-    pub fn cycle_increment(&mut self) {
-        let increments = Self::get_increments();
-        self.increment_index = (self.increment_index + 1) % increments.len();
-        self.increment = increments[self.increment_index];
-    }
-
-    pub fn increase_position(&mut self) {
-        self.target_position += self.increment;
-    }
-
-    pub fn decrease_position(&mut self) {
-        self.target_position -= self.increment;
-    }
-
-    pub fn set_target_zero(&mut self) {
-        self.target_position = 0.0;
+    pub fn set_rel_position(&mut self, position_offset: f32) {
+        self.target_position += position_offset;
     }
 
     pub fn toggle_lock_mode(&mut self) {
@@ -107,7 +102,7 @@ impl ControlPresets {
     /// High stiffness configuration for normal operation
     pub fn normal_mode() -> ControlConfig {
         ControlConfig {
-            kp: 150.0,
+            kp: 50.0,
             kd: 8.0,
             max_torque: Some(150.0),
             max_velocity: Some(80.0),
@@ -118,7 +113,7 @@ impl ControlPresets {
     /// Maximum stiffness configuration for lock mode
     pub fn lock_mode() -> ControlConfig {
         ControlConfig {
-            kp: 200.0,
+            kp: 100.0,
             kd: 10.0,
             max_torque: Some(200.0),
             max_velocity: Some(100.0),
@@ -173,8 +168,44 @@ pub async fn update_motor_state(
         motor_state.feedback_received = true;
         motor_state.last_feedback_time = Some(Instant::now());
         motor_state.feedback_count += 1;
+
+        update_state_from_feedback(motor_state, &feedback);
     }
     Ok(())
+}
+
+fn update_state_from_feedback(motor_state: &mut MotorState, feedback: &FeedbackFrame) {
+    match motor_state.state {
+        MotorStates::IDLE => {
+            // Maybe use the faults to see if we should go into fault state?
+            if has_fault(feedback) {
+                motor_state.state = MotorStates::FAULT;
+            } else if feedback.velocity > MOVING_VELOCITY_THRESHOLD {
+                motor_state.state = MotorStates::MOVING
+            } 
+        },
+        MotorStates::MOVING => {
+            if has_fault(feedback) {
+                motor_state.state = MotorStates::FAULT;
+            } else if feedback.velocity < MOVING_VELOCITY_THRESHOLD {
+                motor_state.state = MotorStates::IDLE
+            }
+        },
+        MotorStates::LOCKED => {
+            if has_fault(feedback) {
+                motor_state.state = MotorStates::FAULT;
+            }
+        },
+        MotorStates::FAULT => {
+            if !has_fault(feedback) {
+                motor_state.state = MotorStates::IDLE;
+            }            
+        }
+    }
+}
+
+fn has_fault(feedback: &FeedbackFrame) -> bool {
+    feedback.fault_uncalibrated || feedback.fault_hall_encoding || feedback.fault_magnetic_encoding || feedback.fault_over_temperature || feedback.fault_overcurrent || feedback.fault_undervoltage
 }
 
 /// Send position command to motor
@@ -218,111 +249,3 @@ pub async fn apply_control_config(
     Ok(())
 }
 
-/// Single data point in a recording
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RecordingDataPoint {
-    pub timestamp_ms: u64,
-    pub timestamp_utc_micros: i64,
-    pub target_position: f32,
-    pub current_position: f32,
-    pub current_velocity: f32,
-    pub current_torque: f32,
-    pub current_temperature: f32,
-    pub fault_uncalibrated: bool,
-    pub fault_hall_encoding: bool,
-    pub fault_magnetic_encoding: bool,
-    pub fault_over_temperature: bool,
-    pub fault_overcurrent: bool,
-    pub fault_undervoltage: bool,
-}
-
-/// Complete recording episode
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RecordingEpisode {
-    pub actuator_id: u8,
-    pub duration_ms: u64,
-    pub sample_rate_hz: f32,
-    pub data_points: Vec<RecordingDataPoint>,
-    pub control_config: RecordingControlConfig,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RecordingControlConfig {
-    pub kp: f32,
-    pub kd: f32,
-    pub max_torque: f32,
-    pub lock_mode: bool,
-}
-
-/// Record motor data for a specified duration
-pub async fn record_episode(
-    supervisor: &mut Supervisor,
-    motor_state: &mut MotorState,
-    actuator_id: u8,
-    duration_secs: f32,
-) -> Result<RecordingEpisode> {
-    let sample_interval = Duration::from_millis(10); // 100 Hz sampling
-    let total_duration = Duration::from_secs_f32(duration_secs);
-    let start_time = Instant::now();
-    
-    let mut data_points = Vec::new();
-    
-    info!("Starting recording for {} seconds at 100 Hz", duration_secs);
-    
-    while start_time.elapsed() < total_duration {
-        let loop_start = Instant::now();
-        
-        // Update motor state
-        update_motor_state(supervisor, motor_state, actuator_id).await?;
-        
-        // Get UTC timestamp in microseconds
-        let utc_micros = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_micros() as i64;
-        
-        // Record data point
-        let data_point = RecordingDataPoint {
-            timestamp_ms: start_time.elapsed().as_millis() as u64,
-            timestamp_utc_micros: utc_micros,
-            target_position: motor_state.target_position,
-            current_position: motor_state.current_position,
-            current_velocity: motor_state.current_velocity,
-            current_torque: motor_state.current_torque,
-            current_temperature: motor_state.current_temperature,
-            fault_uncalibrated: motor_state.fault_uncalibrated,
-            fault_hall_encoding: motor_state.fault_hall_encoding,
-            fault_magnetic_encoding: motor_state.fault_magnetic_encoding,
-            fault_over_temperature: motor_state.fault_over_temperature,
-            fault_overcurrent: motor_state.fault_overcurrent,
-            fault_undervoltage: motor_state.fault_undervoltage,
-        };
-        
-        data_points.push(data_point);
-        
-        // Sleep to maintain sample rate
-        let elapsed = loop_start.elapsed();
-        if elapsed < sample_interval {
-            tokio::time::sleep(sample_interval - elapsed).await;
-        }
-    }
-    
-    let actual_duration_ms = start_time.elapsed().as_millis() as u64;
-    let sample_rate = data_points.len() as f32 / (actual_duration_ms as f32 / 1000.0);
-    
-    info!("Recording complete: {} samples in {}ms ({:.1} Hz)", 
-          data_points.len(), actual_duration_ms, sample_rate);
-    
-    Ok(RecordingEpisode {
-        actuator_id,
-        duration_ms: actual_duration_ms,
-        sample_rate_hz: sample_rate,
-        data_points,
-        control_config: RecordingControlConfig {
-            kp: motor_state.current_kp,
-            kd: motor_state.current_kd,
-            max_torque: motor_state.current_max_torque,
-            lock_mode: motor_state.lock_mode,
-        },
-    })
-}

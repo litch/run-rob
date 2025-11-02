@@ -1,104 +1,170 @@
-use run_rob::{
-    MotorState, ControlPresets, scan_actuators, update_motor_state, 
-    send_position_command, apply_control_config,
-};
-use robstride::{
-    robstride00::RobStride00, ActuatorConfiguration, ActuatorType, 
-    SocketCanTransport, Supervisor, TransportType
-};
-use std::time::Duration;
-use tracing::{error, info};
-use tracing_subscriber::EnvFilter;
-use ratatui::{
-    backend::CrosstermBackend,
-    layout::{Constraint, Direction, Layout, Alignment},
-    style::{Color, Modifier, Style},
-    text::{Line, Span},
-    widgets::{Block, Borders, Paragraph, List, ListItem},
-    Terminal,
-};
 use crossterm::{
     event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind},
     execute,
-    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
+use ratatui::{
+    Terminal,
+    backend::CrosstermBackend,
+    layout::{Alignment, Constraint, Direction, Layout},
+    style::{Color, Modifier, Style},
+    text::{Line, Span},
+    widgets::{Block, Borders, List, ListItem, Paragraph},
+};
+use serde::{Deserialize, Serialize};
 use std::io;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+use tokio::sync::RwLock;
+use tracing::{error, info};
+use tracing_subscriber::EnvFilter;
+use zenoh::prelude::r#async::*;
+use zenoh::publication::Publisher;
+
+// TUI-specific state with increment logic
+#[derive(Debug, Clone)]
+struct TuiState {
+    yaw_target: f32,
+    pitch_target: f32,
+    increment: f32,
+    increment_index: usize,
+}
+
+impl TuiState {
+    fn new() -> Self {
+        Self {
+            yaw_target: 0.0,
+            pitch_target: 0.0,
+            increment: 0.1,
+            increment_index: 2,
+        }
+    }
+
+    fn get_increments() -> Vec<f32> {
+        vec![0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0]
+    }
+
+    fn cycle_increment(&mut self) {
+        let increments = Self::get_increments();
+        self.increment_index = (self.increment_index + 1) % increments.len();
+        self.increment = increments[self.increment_index];
+    }
+}
+
+// Messages from bus
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct GimbalState {
+    pub yaw_position: f32,
+    pub pitch_position: f32,
+    pub yaw_velocity: f32,
+    pub pitch_velocity: f32,
+    pub yaw_torque: f32,
+    pub pitch_torque: f32,
+    pub yaw_temperature: f32,
+    pub pitch_temperature: f32,
+    pub timestamp_ms: u64,
+}
+
+// Commands to bus
+#[derive(Debug, Clone, Serialize, Deserialize)]
+enum GimbalCoreCommand {
+    Slew(SlewCommand),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SlewCommand {
+    pub yaw: f32,
+    pub pitch: f32,
+    pub timestamp_ms: u64,
+}
+
+impl SlewCommand {
+    fn new(yaw: f32, pitch: f32) -> Self {
+        Self {
+            yaw,
+            pitch,
+            timestamp_ms: std::time::SystemTime::now()
+                .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as u64,
+        }
+    }
+}
 
 #[tokio::main]
 async fn main() -> eyre::Result<()> {
-    // Initialize logging to file instead of stdout (since we're using TUI)
-    let file_appender = tracing_appender::rolling::daily("./logs", "motor-control.log");
+    // Initialize logging to file
+    let file_appender = tracing_appender::rolling::daily("./logs", "tui.log");
     let (non_blocking, _guard) = tracing_appender::non_blocking(file_appender);
-    
+
     tracing_subscriber::fmt()
         .with_writer(non_blocking)
-        .with_env_filter(EnvFilter::from_default_env()
-            .add_directive("polling=off".parse().unwrap())
-            .add_directive("async_io=off".parse().unwrap()),
+        .with_env_filter(
+            EnvFilter::from_default_env()
+                .add_directive("polling=off".parse().unwrap())
+                .add_directive("async_io=off".parse().unwrap()),
         )
         .init();
 
-    // Setup motor
-    let mut supervisor = Supervisor::new(Duration::from_millis(1000))?;
-    let socketcan = SocketCanTransport::new("can0".to_string()).await?;
-    supervisor
-        .add_transport("socketcan".to_string(), TransportType::SocketCAN(socketcan))
-        .await?;
+    info!("Starting Gimbal TUI");
 
-    let mut supervisor_runner = supervisor.clone_controller();
-    let supervisor_handle = tokio::spawn(async move {
-        info!("starting supervisor task");
-        if let Err(e) = supervisor_runner.run(Duration::from_millis(10)).await {
-            error!("Supervisor task failed: {}", e);
+    // Connect to Zenoh
+    let zenoh_config = zenoh::config::Config::default();
+    let session = Arc::new(
+        zenoh::open(zenoh_config)
+            .res()
+            .await
+            .map_err(|e| eyre::eyre!("Failed to connect to Zenoh: {:?}", e))?,
+    );
+    info!("Connected to Zenoh");
+
+    let namespace = std::env::var("ZENOH_NAMESPACE").unwrap_or_else(|_| "gimbal".to_string());
+    let state_topic = format!("{}/gimbal_core/state", namespace);
+    let command_topic = format!("{}/gimbal_core/command", namespace);
+
+    info!("Subscribing to state: {}", state_topic);
+    info!("Publishing commands to: {}", command_topic);
+
+    // Subscribe to state updates
+    let subscriber = session
+        .declare_subscriber(state_topic)
+        .res()
+        .await
+        .map_err(|e| eyre::eyre!("Failed to subscribe: {:?}", e))?;
+    let command_publisher = session
+        .declare_publisher(command_topic)
+        .res()
+        .await
+        .map_err(|e| eyre::eyre!("Failed to create publisher: {:?}", e))?;
+
+    // Shared state
+    let gimbal_state = Arc::new(RwLock::new(None::<GimbalState>));
+    let last_update = Arc::new(RwLock::new(Instant::now()));
+
+    // Spawn state receiver
+    let gimbal_state_clone = gimbal_state.clone();
+    let last_update_clone = last_update.clone();
+    tokio::spawn(async move {
+        loop {
+            match subscriber.recv_async().await {
+                Ok(sample) => {
+                    let payload = sample.value.payload.contiguous();
+                    match serde_json::from_slice::<GimbalState>(&payload) {
+                        Ok(state) => {
+                            *gimbal_state_clone.write().await = Some(state);
+                            *last_update_clone.write().await = Instant::now();
+                        }
+                        Err(e) => {
+                            error!("Failed to deserialize state: {}", e);
+                        }
+                    }
+                }
+                Err(e) => {
+                    error!("Failed to receive state: {}", e);
+                }
+            }
         }
     });
-
-    // Scan for available actuators first
-    info!("Scanning for available actuators...");
-    let available_actuators = scan_actuators(&mut supervisor).await?;
-    
-    // Use first available actuator, or default to 1
-    let actuator_id = *available_actuators.first().unwrap_or(&1);
-    info!("Auto-connecting to actuator {}", actuator_id);
-    
-    supervisor.add_actuator(
-        Box::new(RobStride00::new(
-            actuator_id,
-            0xFE,
-            supervisor.get_transport_tx("socketcan").await?,
-        )),
-        ActuatorConfiguration {
-            actuator_type: ActuatorType::RobStride00,
-            ..Default::default()
-        },
-    ).await;
-
-    info!("Enabling the actuator {}", actuator_id);
-
-    // Start with high stiffness configuration
-    let cfg = ControlPresets::normal_mode();
-    supervisor.configure(actuator_id, cfg.clone()).await?;
-    supervisor.enable(actuator_id).await?;
-    supervisor.zero(actuator_id).await?;
-
-    tokio::time::sleep(Duration::from_millis(500)).await;
-
-    // Initialize motor state
-    let mut motor_state = MotorState::new();
-    motor_state.motor_enabled = true;
-    
-    // Get initial feedback
-    if let Ok(Some((feedback, _))) = supervisor.get_feedback(actuator_id).await {
-        motor_state.current_position = feedback.angle;
-        motor_state.target_position = feedback.angle;
-        motor_state.feedback_received = true;
-        motor_state.last_feedback_time = Some(std::time::Instant::now());
-        motor_state.feedback_count = 1;
-        info!("Initial feedback received: angle={:.4}, velocity={:.4}, torque={:.4}", 
-              feedback.angle, feedback.velocity, feedback.torque);
-    } else {
-        info!("WARNING: No initial feedback received from motor!");
-    }
 
     // Setup terminal
     enable_raw_mode()?;
@@ -107,7 +173,13 @@ async fn main() -> eyre::Result<()> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let result = run_tui(&mut terminal, &mut motor_state, &mut supervisor, actuator_id).await;
+    let result = run_tui(
+        &mut terminal,
+        gimbal_state,
+        last_update,
+        command_publisher,
+    )
+    .await;
 
     // Restore terminal
     disable_raw_mode()?;
@@ -118,115 +190,21 @@ async fn main() -> eyre::Result<()> {
     )?;
     terminal.show_cursor()?;
 
-    // Cleanup
-    supervisor.command(actuator_id, 0.0, 0.0, 0.0).await?;
-    supervisor_handle.abort();
-    supervisor.disable(actuator_id, false).await?;
-
     result
 }
 
 async fn run_tui(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
-    motor_state: &mut MotorState,
-    supervisor: &mut Supervisor,
-    actuator_id: u8,
+    gimbal_state: Arc<RwLock<Option<GimbalState>>>,
+    last_update: Arc<RwLock<Instant>>,
+    command_publisher: Publisher<'static>,
 ) -> eyre::Result<()> {
-    let mut last_update = std::time::Instant::now();
-    let mut current_lock_mode = motor_state.lock_mode;
-    
-    // Track motor states for both motors
-    let mut motor_states: Vec<MotorState> = vec![MotorState::new(), MotorState::new()];
-    let mut motors: Vec<u8> = Vec::new();
-    
+    let mut tui_state = TuiState::new();
+
     loop {
-        // Scan for available actuators every 5 seconds
-        if motor_state.last_scan_time.is_none() || 
-           motor_state.last_scan_time.unwrap().elapsed() >= Duration::from_secs(5) {
-            // Scan bus for actuators
-            let actuator_configs = vec![
-                (1, ActuatorConfiguration { actuator_type: ActuatorType::RobStride00, ..Default::default() }),
-                (2, ActuatorConfiguration { actuator_type: ActuatorType::RobStride00, ..Default::default() }),
-                (3, ActuatorConfiguration { actuator_type: ActuatorType::RobStride00, ..Default::default() }),
-                (127, ActuatorConfiguration { actuator_type: ActuatorType::RobStride00, ..Default::default() }),
-            ];
-            
-            if let Ok(found_actuators) = supervisor.scan_bus(0xFE, "socketcan", &actuator_configs).await {
-                motor_state.available_actuators = found_actuators.clone();
-                motor_state.last_scan_time = Some(std::time::Instant::now());
-                info!("Scanned bus, found {} actuators: {:?}", motor_state.available_actuators.len(), motor_state.available_actuators);
-                
-                // Initialize motors array if we have actuators
-                if motors.is_empty() && found_actuators.len() >= 2 {
-                    motors = found_actuators;
-                    
-                    // Initialize both motors
-                    for (idx, &motor_id) in motors.iter().enumerate().take(2) {
-                        supervisor.add_actuator(
-                            Box::new(RobStride00::new(
-                                motor_id,
-                                0xFE,
-                                supervisor.get_transport_tx("socketcan").await?,
-                            )),
-                            ActuatorConfiguration {
-                                actuator_type: ActuatorType::RobStride00,
-                                ..Default::default()
-                            },
-                        ).await;
-                        
-                        let cfg = ControlPresets::normal_mode();
-                        supervisor.configure(motor_id, cfg.clone()).await?;
-                        supervisor.enable(motor_id).await?;
-                        supervisor.zero(motor_id).await?;
-                        
-                        motor_states[idx].motor_enabled = true;
-                        motor_states[idx].current_kp = cfg.kp;
-                        motor_states[idx].current_kd = cfg.kd;
-                        motor_states[idx].current_max_torque = cfg.max_torque.unwrap_or(0.0);
-                        
-                        info!("Initialized motor {} (motors[{}])", motor_id, idx);
-                    }
-                }
-            }
-        }
-        
-        // Check if lock mode changed and update motor configuration
-        if current_lock_mode != motor_state.lock_mode {
-            apply_control_config(supervisor, motor_state, actuator_id).await?;
-            current_lock_mode = motor_state.lock_mode;
-        }
-        
-        // Update motor feedback at regular intervals
-        if last_update.elapsed() >= Duration::from_millis(50) && motors.len() >= 2 {
-            // Update both motors
-            for (idx, &motor_id) in motors.iter().enumerate().take(2) {
-                update_motor_state(supervisor, &mut motor_states[idx], motor_id).await?;
-                
-                // Log feedback periodically
-                if motor_states[idx].feedback_count % 20 == 0 {
-                    info!("Motor {} (motors[{}]) Feedback #{}: angle={:.4}, vel={:.4}, torque={:.4}", 
-                          motor_id, idx, motor_states[idx].feedback_count, 
-                          motor_states[idx].current_position, 
-                          motor_states[idx].current_velocity, 
-                          motor_states[idx].current_torque);
-                }
-                
-                // Send position command
-                send_position_command(supervisor, &mut motor_states[idx], motor_id).await?;
-            }
-            
-            // Update display state with tilt motor (motors[0]) info
-            if motors.len() >= 1 {
-                motor_state.current_position = motor_states[0].current_position;
-                motor_state.current_velocity = motor_states[0].current_velocity;
-                motor_state.current_torque = motor_states[0].current_torque;
-                motor_state.current_temperature = motor_states[0].current_temperature;
-                motor_state.feedback_received = motor_states[0].feedback_received;
-                motor_state.feedback_count = motor_states[0].feedback_count;
-            }
-            
-            last_update = std::time::Instant::now();
-        }
+        // Get current state
+        let state = gimbal_state.read().await.clone();
+        let update_age = last_update.read().await.elapsed();
 
         // Draw UI
         terminal.draw(|f| {
@@ -235,7 +213,7 @@ async fn run_tui(
                 .margin(2)
                 .constraints([
                     Constraint::Length(3),
-                    Constraint::Length(8),
+                    Constraint::Length(6),
                     Constraint::Min(15),
                     Constraint::Length(8),
                     Constraint::Length(7),
@@ -243,87 +221,60 @@ async fn run_tui(
                 .split(f.area());
 
             // Title
-            let title = Paragraph::new("RobStride Motor Controller")
-                .style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))
+            let title = Paragraph::new("Gimbal Controller (Zenoh Client)")
+                .style(
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                )
                 .alignment(Alignment::Center)
                 .block(Block::default().borders(Borders::ALL));
             f.render_widget(title, chunks[0]);
 
             // Connection Status
-            let connection_status = if motor_state.feedback_received {
+            let connection_status = if state.is_some() && update_age < Duration::from_secs(1) {
                 ("CONNECTED", Color::Green)
             } else {
                 ("DISCONNECTED", Color::Red)
             };
-            
-            let motor_status = if motor_state.motor_enabled {
-                ("ENABLED", Color::Green)
-            } else {
-                ("DISABLED", Color::Yellow)
-            };
-
-            let feedback_age = motor_state.last_feedback_time
-                .map(|t| t.elapsed().as_millis())
-                .unwrap_or(9999);
-            
-            let lock_status = if motor_state.lock_mode {
-                ("LOCKED", Color::Red)
-            } else {
-                ("NORMAL", Color::Green)
-            };
-
-            // Format available actuators list
-            let actuators_str = if motor_state.available_actuators.is_empty() {
-                "Scanning...".to_string()
-            } else {
-                motor_state.available_actuators.iter()
-                    .map(|id| {
-                        if *id == actuator_id {
-                            format!("[{}]", id)  // Highlight current actuator
-                        } else {
-                            format!("{}", id)
-                        }
-                    })
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            };
 
             let connection_text = vec![
                 Line::from(vec![
-                    Span::styled("Connection: ", Style::default().fg(Color::Yellow)),
-                    Span::styled(connection_status.0, Style::default().fg(connection_status.1).add_modifier(Modifier::BOLD)),
-                    Span::raw("  |  "),
-                    Span::styled("Motor: ", Style::default().fg(Color::Yellow)),
-                    Span::styled(motor_status.0, Style::default().fg(motor_status.1).add_modifier(Modifier::BOLD)),
+                    Span::styled("Bus Connection: ", Style::default().fg(Color::Yellow)),
+                    Span::styled(
+                        connection_status.0,
+                        Style::default()
+                            .fg(connection_status.1)
+                            .add_modifier(Modifier::BOLD),
+                    ),
                 ]),
                 Line::from(vec![
-                    Span::styled("Lock Mode: ", Style::default().fg(Color::Yellow)),
-                    Span::styled(lock_status.0, Style::default().fg(lock_status.1).add_modifier(Modifier::BOLD)),
+                    Span::styled("Last Update: ", Style::default().fg(Color::Yellow)),
+                    Span::styled(
+                        format!("{}ms ago", update_age.as_millis()),
+                        Style::default().fg(if update_age.as_millis() < 100 {
+                            Color::Green
+                        } else if update_age.as_millis() < 500 {
+                            Color::Yellow
+                        } else {
+                            Color::Red
+                        }),
+                    ),
                 ]),
                 Line::from(vec![
-                    Span::styled("Commands Sent: ", Style::default().fg(Color::Yellow)),
-                    Span::styled(format!("{}", motor_state.command_count), Style::default().fg(Color::Cyan)),
-                    Span::raw("  |  "),
-                    Span::styled("Feedback Received: ", Style::default().fg(Color::Yellow)),
-                    Span::styled(format!("{}", motor_state.feedback_count), Style::default().fg(Color::Cyan)),
-                ]),
-                Line::from(vec![
-                    Span::styled("Last Feedback: ", Style::default().fg(Color::Yellow)),
-                    Span::styled(format!("{}ms ago", feedback_age), 
-                        Style::default().fg(if feedback_age < 100 { Color::Green } else if feedback_age < 500 { Color::Yellow } else { Color::Red })),
-                ]),
-                Line::from(vec![
-                    Span::styled("Active Actuator: ", Style::default().fg(Color::Yellow)),
-                    Span::styled(format!("{}", actuator_id), Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
-                ]),
-                Line::from(vec![
-                    Span::styled("Available Actuators: ", Style::default().fg(Color::Yellow)),
-                    Span::styled(actuators_str, Style::default().fg(Color::Green)),
+                    Span::styled("Target: ", Style::default().fg(Color::Yellow)),
+                    Span::styled(
+                        format!("Yaw: {:.3}, Pitch: {:.3}", tui_state.yaw_target, tui_state.pitch_target),
+                        Style::default().fg(Color::Cyan),
+                    ),
                 ]),
             ];
-            
-            let connection = Paragraph::new(connection_text)
-                .block(Block::default().borders(Borders::ALL).title("Connection & Diagnostics"));
+
+            let connection = Paragraph::new(connection_text).block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title("Status"),
+            );
             f.render_widget(connection, chunks[1]);
 
             // Motor Status - Split into two columns
@@ -331,127 +282,211 @@ async fn run_tui(
                 .direction(Direction::Horizontal)
                 .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
                 .split(chunks[2]);
-            
-            // Helper function to create motor status text
-            let create_motor_status = |state: &MotorState, motor_id: u8, _motor_name: &str| {
-                let temp_color = if state.current_temperature > 60.0 {
+
+            // Yaw Motor
+            let yaw_text = if let Some(ref s) = state {
+                let temp_color = if s.yaw_temperature > 60.0 {
                     Color::Red
-                } else if state.current_temperature > 50.0 {
+                } else if s.yaw_temperature > 50.0 {
                     Color::Yellow
                 } else {
                     Color::Green
                 };
-                
-                let has_faults = state.fault_uncalibrated || state.fault_hall_encoding || 
-                                state.fault_magnetic_encoding || state.fault_over_temperature ||
-                                state.fault_overcurrent || state.fault_undervoltage;
-                
+
                 vec![
                     Line::from(vec![
-                        Span::styled(format!("ID: {}", motor_id), Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+                        Span::styled("Position: ", Style::default().fg(Color::Yellow)),
+                        Span::styled(
+                            format!("{:6.3} rad", s.yaw_position),
+                            Style::default().fg(Color::White),
+                        ),
                     ]),
                     Line::from(vec![
-                        Span::styled("Target:  ", Style::default().fg(Color::Yellow)),
-                        Span::styled(format!("{:6.3} rad", state.target_position), Style::default().fg(Color::Green)),
+                        Span::styled("Target:   ", Style::default().fg(Color::Yellow)),
+                        Span::styled(
+                            format!("{:6.3} rad", tui_state.yaw_target),
+                            Style::default().fg(Color::Green),
+                        ),
                     ]),
                     Line::from(vec![
-                        Span::styled("Current: ", Style::default().fg(Color::Yellow)),
-                        Span::styled(format!("{:6.3} rad", state.current_position), Style::default().fg(Color::White)),
-                    ]),
-                    Line::from(vec![
-                        Span::styled("Error:   ", Style::default().fg(Color::Yellow)),
-                        Span::styled(format!("{:6.3} rad", state.target_position - state.current_position), Style::default().fg(Color::Red)),
-                    ]),
-                    Line::from(""),
-                    Line::from(vec![
-                        Span::styled("Vel:  ", Style::default().fg(Color::Yellow)),
-                        Span::styled(format!("{:6.3} rad/s", state.current_velocity), Style::default().fg(Color::White)),
-                    ]),
-                    Line::from(vec![
-                        Span::styled("Torq: ", Style::default().fg(Color::Yellow)),
-                        Span::styled(format!("{:6.3} Nm", state.current_torque), Style::default().fg(Color::White)),
-                    ]),
-                    Line::from(vec![
-                        Span::styled("Temp: ", Style::default().fg(Color::Yellow)),
-                        Span::styled(format!("{:4.1} °C", state.current_temperature), Style::default().fg(temp_color)),
+                        Span::styled("Error:    ", Style::default().fg(Color::Yellow)),
+                        Span::styled(
+                            format!("{:6.3} rad", tui_state.yaw_target - s.yaw_position),
+                            Style::default().fg(Color::Red),
+                        ),
                     ]),
                     Line::from(""),
                     Line::from(vec![
-                        Span::styled("Faults: ", Style::default().fg(Color::Yellow)),
-                        Span::styled(if has_faults { "YES" } else { "None" }, 
-                            Style::default().fg(if has_faults { Color::Red } else { Color::Green })),
+                        Span::styled("Velocity: ", Style::default().fg(Color::Yellow)),
+                        Span::styled(
+                            format!("{:6.3} rad/s", s.yaw_velocity),
+                            Style::default().fg(Color::White),
+                        ),
                     ]),
                     Line::from(vec![
-                        Span::styled("Feedback: ", Style::default().fg(Color::Yellow)),
-                        Span::styled(format!("{}", state.feedback_count), Style::default().fg(Color::Cyan)),
+                        Span::styled("Torque:   ", Style::default().fg(Color::Yellow)),
+                        Span::styled(
+                            format!("{:6.3} Nm", s.yaw_torque),
+                            Style::default().fg(Color::White),
+                        ),
+                    ]),
+                    Line::from(vec![
+                        Span::styled("Temp:     ", Style::default().fg(Color::Yellow)),
+                        Span::styled(
+                            format!("{:4.1} °C", s.yaw_temperature),
+                            Style::default().fg(temp_color),
+                        ),
                     ]),
                 ]
+            } else {
+                vec![Line::from("Waiting for data...")]
             };
-            
-            // Render tilt motor (motors[0])
-            if motors.len() >= 1 {
-                let tilt_status = create_motor_status(&motor_states[0], motors[0], "TILT");
-                let tilt_widget = Paragraph::new(tilt_status)
-                    .block(Block::default().borders(Borders::ALL).title("TILT Motor (↑/↓)"));
-                f.render_widget(tilt_widget, motor_columns[0]);
-            }
-            
-            // Render pan motor (motors[1])
-            if motors.len() >= 2 {
-                let pan_status = create_motor_status(&motor_states[1], motors[1], "PAN");
-                let pan_widget = Paragraph::new(pan_status)
-                    .block(Block::default().borders(Borders::ALL).title("PAN Motor (←/→)"));
-                f.render_widget(pan_widget, motor_columns[1]);
-            }
+
+            let yaw_widget = Paragraph::new(yaw_text).block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title("YAW Motor (←/→)"),
+            );
+            f.render_widget(yaw_widget, motor_columns[0]);
+
+            // Pitch Motor
+            let pitch_text = if let Some(ref s) = state {
+                let temp_color = if s.pitch_temperature > 60.0 {
+                    Color::Red
+                } else if s.pitch_temperature > 50.0 {
+                    Color::Yellow
+                } else {
+                    Color::Green
+                };
+
+                vec![
+                    Line::from(vec![
+                        Span::styled("Position: ", Style::default().fg(Color::Yellow)),
+                        Span::styled(
+                            format!("{:6.3} rad", s.pitch_position),
+                            Style::default().fg(Color::White),
+                        ),
+                    ]),
+                    Line::from(vec![
+                        Span::styled("Target:   ", Style::default().fg(Color::Yellow)),
+                        Span::styled(
+                            format!("{:6.3} rad", tui_state.pitch_target),
+                            Style::default().fg(Color::Green),
+                        ),
+                    ]),
+                    Line::from(vec![
+                        Span::styled("Error:    ", Style::default().fg(Color::Yellow)),
+                        Span::styled(
+                            format!("{:6.3} rad", tui_state.pitch_target - s.pitch_position),
+                            Style::default().fg(Color::Red),
+                        ),
+                    ]),
+                    Line::from(""),
+                    Line::from(vec![
+                        Span::styled("Velocity: ", Style::default().fg(Color::Yellow)),
+                        Span::styled(
+                            format!("{:6.3} rad/s", s.pitch_velocity),
+                            Style::default().fg(Color::White),
+                        ),
+                    ]),
+                    Line::from(vec![
+                        Span::styled("Torque:   ", Style::default().fg(Color::Yellow)),
+                        Span::styled(
+                            format!("{:6.3} Nm", s.pitch_torque),
+                            Style::default().fg(Color::White),
+                        ),
+                    ]),
+                    Line::from(vec![
+                        Span::styled("Temp:     ", Style::default().fg(Color::Yellow)),
+                        Span::styled(
+                            format!("{:4.1} °C", s.pitch_temperature),
+                            Style::default().fg(temp_color),
+                        ),
+                    ]),
+                ]
+            } else {
+                vec![Line::from("Waiting for data...")]
+            };
+
+            let pitch_widget = Paragraph::new(pitch_text).block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title("PITCH Motor (↑/↓)"),
+            );
+            f.render_widget(pitch_widget, motor_columns[1]);
 
             // Available Increments
-            let increments = MotorState::get_increments();
+            let increments = TuiState::get_increments();
             let increment_items: Vec<ListItem> = increments
                 .iter()
                 .enumerate()
                 .map(|(i, inc)| {
-                    let style = if i == motor_state.increment_index {
-                        Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)
+                    let style = if i == tui_state.increment_index {
+                        Style::default()
+                            .fg(Color::Green)
+                            .add_modifier(Modifier::BOLD)
                     } else {
                         Style::default().fg(Color::Gray)
                     };
-                    let marker = if i == motor_state.increment_index { "→ " } else { "  " };
+                    let marker = if i == tui_state.increment_index {
+                        "→ "
+                    } else {
+                        "  "
+                    };
                     ListItem::new(format!("{}{:.4} rad", marker, inc)).style(style)
                 })
                 .collect();
-            
-            let increments_list = List::new(increment_items)
-                .block(Block::default().borders(Borders::ALL).title("Available Increments (Tab to cycle)"));
+
+            let increments_list = List::new(increment_items).block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title("Available Increments (Tab to cycle)"),
+            );
             f.render_widget(increments_list, chunks[3]);
 
             // Controls
             let controls_text = vec![
                 Line::from(vec![
-                    Span::styled("↑/↓", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
-                    Span::raw("  Control TILT motor (motors[0])  "),
+                    Span::styled(
+                        "↑/↓",
+                        Style::default()
+                            .fg(Color::Cyan)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::raw("  Control PITCH motor  "),
+                    Span::styled(
+                        "←/→",
+                        Style::default()
+                            .fg(Color::Cyan)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::raw("  Control YAW motor"),
                 ]),
                 Line::from(vec![
-                    Span::styled("←/→", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
-                    Span::raw("  Control PAN motor (motors[1])"),
-                ]),
-                Line::from(vec![
-                    Span::styled("Tab", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+                    Span::styled(
+                        "Tab",
+                        Style::default()
+                            .fg(Color::Cyan)
+                            .add_modifier(Modifier::BOLD),
+                    ),
                     Span::raw("  Cycle increment    "),
-                    Span::styled("0", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
-                    Span::raw("    Set zero point"),
+                    Span::styled(
+                        "Z",
+                        Style::default()
+                            .fg(Color::Cyan)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::raw("    Return to zero"),
                 ]),
                 Line::from(vec![
-                    Span::styled("Z", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
-                    Span::raw("    Return to zero     "),
-                    Span::styled("L", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
-                    Span::raw("    Toggle Lock"),
-                ]),
-                Line::from(vec![
-                    Span::styled("Q/Esc", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
+                    Span::styled(
+                        "Q/Esc",
+                        Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                    ),
                     Span::raw("  Quit"),
                 ]),
             ];
-            
+
             let controls = Paragraph::new(controls_text)
                 .block(Block::default().borders(Borders::ALL).title("Controls"));
             f.render_widget(controls, chunks[4]);
@@ -466,58 +501,33 @@ async fn run_tui(
                             break;
                         }
                         KeyCode::Up => {
-                            // Control tilt motor (motors[0])
-                            if motors.len() >= 1 {
-                                motor_states[0].increase_position();
-                                info!("Tilt motor (motors[0], ID {}): target={:.4}", motors[0], motor_states[0].target_position);
-                            }
+                            tui_state.pitch_target += tui_state.increment;
+                            send_command(&command_publisher, tui_state.yaw_target, tui_state.pitch_target).await?;
+                            info!("Pitch target: {:.4}", tui_state.pitch_target);
                         }
                         KeyCode::Down => {
-                            // Control tilt motor (motors[0])
-                            if motors.len() >= 1 {
-                                motor_states[0].decrease_position();
-                                info!("Tilt motor (motors[0], ID {}): target={:.4}", motors[0], motor_states[0].target_position);
-                            }
+                            tui_state.pitch_target -= tui_state.increment;
+                            send_command(&command_publisher, tui_state.yaw_target, tui_state.pitch_target).await?;
+                            info!("Pitch target: {:.4}", tui_state.pitch_target);
                         }
                         KeyCode::Left => {
-                            // Control pan motor (motors[1])
-                            if motors.len() >= 2 {
-                                motor_states[1].decrease_position();
-                                info!("Pan motor (motors[1], ID {}): target={:.4}", motors[1], motor_states[1].target_position);
-                            }
+                            tui_state.yaw_target -= tui_state.increment;
+                            send_command(&command_publisher, tui_state.yaw_target, tui_state.pitch_target).await?;
+                            info!("Yaw target: {:.4}", tui_state.yaw_target);
                         }
                         KeyCode::Right => {
-                            // Control pan motor (motors[1])
-                            if motors.len() >= 2 {
-                                motor_states[1].increase_position();
-                                info!("Pan motor (motors[1], ID {}): target={:.4}", motors[1], motor_states[1].target_position);
-                            }
+                            tui_state.yaw_target += tui_state.increment;
+                            send_command(&command_publisher, tui_state.yaw_target, tui_state.pitch_target).await?;
+                            info!("Yaw target: {:.4}", tui_state.yaw_target);
                         }
                         KeyCode::Tab => {
-                            // Cycle increment for both motors
-                            motor_states[0].cycle_increment();
-                            motor_states[1].cycle_increment();
-                            motor_state.increment = motor_states[0].increment;
-                            motor_state.increment_index = motor_states[0].increment_index;
-                        }
-                        KeyCode::Char('0') => {
-                            // Set current position as zero for both motors
-                            if motors.len() >= 2 {
-                                let _ = supervisor.zero(motors[0]).await;
-                                let _ = supervisor.zero(motors[1]).await;
-                                motor_states[0].target_position = 0.0;
-                                motor_states[1].target_position = 0.0;
-                                info!("Set zero point for both motors");
-                            }
+                            tui_state.cycle_increment();
                         }
                         KeyCode::Char('z') | KeyCode::Char('Z') => {
-                            // Command both motors to return to zero position
-                            motor_states[0].set_target_zero();
-                            motor_states[1].set_target_zero();
-                            info!("Returning both motors to zero");
-                        }
-                        KeyCode::Char('l') | KeyCode::Char('L') => {
-                            motor_state.toggle_lock_mode();
+                            tui_state.yaw_target = 0.0;
+                            tui_state.pitch_target = 0.0;
+                            send_command(&command_publisher, 0.0, 0.0).await?;
+                            info!("Returning to zero");
                         }
                         _ => {}
                     }
@@ -528,5 +538,16 @@ async fn run_tui(
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
 
+    Ok(())
+}
+
+async fn send_command(publisher: &Publisher<'static>, yaw: f32, pitch: f32) -> eyre::Result<()> {
+    let cmd = GimbalCoreCommand::Slew(SlewCommand::new(yaw, pitch));
+    let json = serde_json::to_string(&cmd)?;
+    publisher
+        .put(json)
+        .res()
+        .await
+        .map_err(|e| eyre::eyre!("Failed to send command: {:?}", e))?;
     Ok(())
 }

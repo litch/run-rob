@@ -8,12 +8,12 @@ name = "run_rob"
 path = "src/lib.rs"
 
 [[bin]]
-name = "run-rob-tui"
-path = "src/bin/tui.rs"
+name = "run-rob"
+path = "src/bin/bus.rs"
 
 [[bin]]
-name = "run-rob-api"
-path = "src/bin/api.rs"
+name = "run-rob-tui"
+path = "src/bin/tui.rs"
 
 [dependencies]
 anyhow = "1.0.100"
@@ -30,12 +30,10 @@ serde_json = "1.0"
 ratatui = { version = "0.28", optional = true }
 crossterm = { version = "0.28", optional = true }
 
-# API dependencies
-axum = { version = "0.7", optional = true }
-tower = { version = "0.4", optional = true }
-tower-http = { version = "0.5", features = ["cors"], optional = true }
+# Bus dependencies
+zenoh = { version = "0.11", optional = true }
 
 [features]
-default = ["tui", "api"]
-tui = ["ratatui", "crossterm"]
-api = ["axum", "tower", "tower-http"]
+default = ["tui", "bus"]
+tui = ["ratatui", "crossterm", "zenoh"]
+bus = ["zenoh"]
