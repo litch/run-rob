@@ -31,7 +31,7 @@ ratatui = { version = "0.28", optional = true }
 crossterm = { version = "0.28", optional = true }
 
 # Bus dependencies
-zenoh = { version = "0.11", optional = true }
+zenoh = { version = "1.6.2", optional = true }
 
 [features]
 default = ["tui", "bus"]

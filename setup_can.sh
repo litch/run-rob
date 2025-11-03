@@ -9,9 +9,9 @@ sudo pkill slcand || true
 # Bring down can0 if it exists
 sudo ip link set can0 down 2>/dev/null || true
 
-# Start slcand
-echo "Starting slcand on /dev/ttyACM1..."
-sudo slcand -o -s8 -t hw /dev/ttyACM1 can0
+DEV=$(readlink -f /dev/serial/by-id/*CANable2*)
+echo "Starting slcand on $DEV ..."
+sudo slcand -o -s8 -t hw "$DEV" can0
 
 # Give it a moment to initialize
 sleep 0.5
