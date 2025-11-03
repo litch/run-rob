@@ -77,6 +77,7 @@ pub struct GimbalState {
 pub struct ZenohBridge {
     state_publisher: zenoh::pubsub::Publisher<'static>,
     motor_states: Arc<RwLock<(MotorState, MotorState)>>, // (yaw, pitch)
+    command_handler: tokio::task::JoinHandle<()>,
 }
 
 impl ZenohBridge {
@@ -104,7 +105,7 @@ impl ZenohBridge {
 
         // Spawn command handler
         let motor_states_clone = motor_states.clone();
-        tokio::spawn(async move {
+        let command_handler = tokio::spawn(async move {
             loop {
                 match command_subscriber.recv_async().await {
                     Ok(sample) => {
@@ -113,8 +114,10 @@ impl ZenohBridge {
                             error!("Failed to handle command: {e}");
                         }
                     }
-                    Err(e) => {
-                        error!("Failed to receive command: {e}");
+                    Err(_) => {
+                        // Channel closed, exit gracefully
+                        info!("Command subscriber closed, stopping handler");
+                        break;
                     }
                 }
             }
@@ -122,6 +125,7 @@ impl ZenohBridge {
         Ok(Self {
             state_publisher,
             motor_states,
+            command_handler,
         })
     }
 
@@ -359,6 +363,7 @@ async fn main() -> Result<()> {
     info!("Shutting down gracefully...");
 
     // Stop background tasks first
+    bridge.command_handler.abort();
     motor_control_handle.abort();
     state_publish_handle.abort();
     
