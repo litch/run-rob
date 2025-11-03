@@ -102,7 +102,7 @@ impl ControlPresets {
     /// High stiffness configuration for normal operation
     pub fn normal_mode() -> ControlConfig {
         ControlConfig {
-            kp: 50.0,
+            kp: 20.0,
             kd: 8.0,
             max_torque: Some(150.0),
             max_velocity: Some(80.0),

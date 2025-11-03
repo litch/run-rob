@@ -29,6 +29,7 @@ struct TuiState {
     increment_index: usize,
     corner_cycle_index: usize,
     corner_cycle_origin: (f32, f32), // Store the origin when cycle starts
+    pattern_running: bool,
 }
 
 impl TuiState {
@@ -40,6 +41,7 @@ impl TuiState {
             increment_index: 2,
             corner_cycle_index: 0,
             corner_cycle_origin: (0.0, 0.0),
+            pattern_running: false,
         }
     }
 
@@ -229,6 +231,8 @@ async fn run_tui(
     command_publisher: Publisher<'static>,
 ) -> eyre::Result<()> {
     let mut tui_state = TuiState::new();
+    let mut last_pattern_update = Instant::now();
+    let pattern_interval = Duration::from_secs(5); // 5 seconds per corner for slow slewing
 
     loop {
         // Get current state
@@ -267,7 +271,7 @@ async fn run_tui(
                 ("DISCONNECTED", Color::Red)
             };
 
-            let connection_text = vec![
+            let mut connection_text = vec![
                 Line::from(vec![
                     Span::styled("Bus Connection: ", Style::default().fg(Color::Yellow)),
                     Span::styled(
@@ -298,6 +302,18 @@ async fn run_tui(
                     ),
                 ]),
             ];
+            
+            if tui_state.pattern_running {
+                connection_text.push(Line::from(vec![
+                    Span::styled("Pattern: ", Style::default().fg(Color::Yellow)),
+                    Span::styled(
+                        format!("RUNNING - Corner {}/4", tui_state.corner_cycle_index),
+                        Style::default()
+                            .fg(Color::Green)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                ]));
+            }
 
             let connection = Paragraph::new(connection_text).block(
                 Block::default()
@@ -514,7 +530,7 @@ async fn run_tui(
                             .fg(Color::Cyan)
                             .add_modifier(Modifier::BOLD),
                     ),
-                    Span::raw("    Cycle corners (±20°/±10° pattern)"),
+                    Span::raw("    Start/Stop corner pattern (±20°/±10°)"),
                 ]),
                 Line::from(vec![
                     Span::styled(
@@ -568,24 +584,30 @@ async fn run_tui(
                             info!("Returning to zero");
                         }
                         KeyCode::Char('x') | KeyCode::Char('X') => {
-                            // First press starts the cycle from current position
-                            if tui_state.corner_cycle_index == 0 {
+                            tui_state.pattern_running = !tui_state.pattern_running;
+                            if tui_state.pattern_running {
                                 tui_state.start_corner_cycle();
-                                info!("Starting corner cycle from yaw={:.3}, pitch={:.3}", 
+                                info!("Starting corner pattern from yaw={:.3}, pitch={:.3}", 
                                       tui_state.corner_cycle_origin.0, tui_state.corner_cycle_origin.1);
+                            } else {
+                                info!("Stopping corner pattern");
                             }
-                            
-                            let (new_yaw, new_pitch) = tui_state.next_corner();
-                            tui_state.yaw_target = new_yaw;
-                            tui_state.pitch_target = new_pitch;
-                            send_command(&command_publisher, new_yaw, new_pitch).await?;
-                            info!("Corner cycle {}/4: yaw={:.3}, pitch={:.3}", 
-                                  tui_state.corner_cycle_index, new_yaw, new_pitch);
                         }
                         _ => {}
                     }
                 }
             }
+        }
+
+        // Handle automated corner pattern
+        if tui_state.pattern_running && last_pattern_update.elapsed() >= pattern_interval {
+            let (new_yaw, new_pitch) = tui_state.next_corner();
+            tui_state.yaw_target = new_yaw;
+            tui_state.pitch_target = new_pitch;
+            send_command(&command_publisher, new_yaw, new_pitch).await?;
+            info!("Corner pattern {}/4: yaw={:.3}, pitch={:.3}", 
+                  tui_state.corner_cycle_index, new_yaw, new_pitch);
+            last_pattern_update = Instant::now();
         }
 
         tokio::time::sleep(Duration::from_millis(10)).await;
