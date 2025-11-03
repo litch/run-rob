@@ -18,6 +18,7 @@ use zenoh::{Session, sample::Sample};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum GimbalCoreCommand {
     Slew(SlewCommand),
+    SlewRelative(SlewRelativeCommand),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -32,6 +33,26 @@ impl SlewCommand {
         Self {
             yaw,
             pitch,
+            timestamp_ms: std::time::SystemTime::now()
+                .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as u64,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SlewRelativeCommand {
+    pub yaw_delta: f32,
+    pub pitch_delta: f32,
+    pub timestamp_ms: u64,
+}
+
+impl SlewRelativeCommand {
+    pub fn new(yaw_delta: f32, pitch_delta: f32) -> Self {
+        Self {
+            yaw_delta,
+            pitch_delta,
             timestamp_ms: std::time::SystemTime::now()
                 .duration_since(std::time::SystemTime::UNIX_EPOCH)
                 .unwrap()
@@ -109,6 +130,8 @@ impl ZenohBridge {
         motor_states: Arc<RwLock<(MotorState, MotorState)>>,
     ) -> Result<()> {
         let payload = sample.payload().to_bytes();
+        info!("Received command: {}", String::from_utf8_lossy(&payload));
+        
         let command: GimbalCoreCommand = serde_json::from_slice(&payload)
             .context("Failed to deserialize command")?;
 
@@ -118,6 +141,15 @@ impl ZenohBridge {
                 let mut states = motor_states.write().await;
                 states.0.set_position(slew.yaw);   // yaw motor
                 states.1.set_position(slew.pitch); // pitch motor
+            }
+            GimbalCoreCommand::SlewRelative(slew_rel) => {
+                info!("Received slew relative command: yaw_delta={:.3}, pitch_delta={:.3}", 
+                      slew_rel.yaw_delta, slew_rel.pitch_delta);
+                let mut states = motor_states.write().await;
+                let new_yaw = states.0.target_position + slew_rel.yaw_delta;
+                let new_pitch = states.1.target_position + slew_rel.pitch_delta;
+                states.0.set_position(new_yaw);   // yaw motor
+                states.1.set_position(new_pitch); // pitch motor
             }
         }
 
