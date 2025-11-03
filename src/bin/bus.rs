@@ -13,8 +13,7 @@ use std::time::Duration;
 use tokio::sync::RwLock;
 use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
-use zenoh::prelude::r#async::*;
-use zenoh::publication::Publisher;
+use zenoh::{Session, sample::Sample};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum GimbalCoreCommand {
@@ -55,7 +54,7 @@ pub struct GimbalState {
 }
 
 pub struct ZenohBridge {
-    state_publisher: Publisher<'static>,
+    state_publisher: zenoh::pubsub::Publisher<'static>,
     motor_states: Arc<RwLock<(MotorState, MotorState)>>, // (yaw, pitch)
 }
 
@@ -69,19 +68,16 @@ impl ZenohBridge {
 
         let state_topic = format!("{}/gimbal_core/state", clean_namespace);
         let command_topic = format!("{}/gimbal_core/command", clean_namespace);
-
         info!("Creating Zenoh pub/sub");
         info!("  State: {}", state_topic);
         info!("  Command: {}", command_topic);
 
         let state_publisher = session
             .declare_publisher(state_topic)
-            .res()
             .await
             .map_err(|e| anyhow::anyhow!("Failed to declare publisher: {:?}", e))?;
         let command_subscriber = session
             .declare_subscriber(command_topic)
-            .res()
             .await
             .map_err(|e| anyhow::anyhow!("Failed to declare subscriber: {:?}", e))?;
 
@@ -102,7 +98,6 @@ impl ZenohBridge {
                 }
             }
         });
-
         Ok(Self {
             state_publisher,
             motor_states,
@@ -113,7 +108,7 @@ impl ZenohBridge {
         sample: Sample,
         motor_states: Arc<RwLock<(MotorState, MotorState)>>,
     ) -> Result<()> {
-        let payload = sample.value.payload.contiguous();
+        let payload = sample.payload().to_bytes();
         let command: GimbalCoreCommand = serde_json::from_slice(&payload)
             .context("Failed to deserialize command")?;
 
@@ -149,7 +144,6 @@ impl ZenohBridge {
         let json = serde_json::to_string(&state)?;
         self.state_publisher
             .put(json)
-            .res()
             .await
             .map_err(|e| anyhow::anyhow!("Failed to publish state: {:?}", e))?;
 
@@ -265,10 +259,9 @@ async fn main() -> Result<()> {
 
     // Setup Zenoh
     info!("Connecting to Zenoh...");
-    let zenoh_config = zenoh::config::Config::default();
+    let zenoh_config = zenoh::Config::default();
     let session = Arc::new(
         zenoh::open(zenoh_config)
-            .res()
             .await
             .map_err(|e| anyhow::anyhow!("Failed to connect to Zenoh: {:?}", e))?,
     );

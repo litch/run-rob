@@ -18,8 +18,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
-use zenoh::prelude::r#async::*;
-use zenoh::publication::Publisher;
+use zenoh::pubsub::Publisher;
 
 // TUI-specific state with increment logic
 #[derive(Debug, Clone)]
@@ -109,10 +108,9 @@ async fn main() -> eyre::Result<()> {
     info!("Starting Gimbal TUI");
 
     // Connect to Zenoh
-    let zenoh_config = zenoh::config::Config::default();
+    let zenoh_config = zenoh::Config::default();
     let session = Arc::new(
         zenoh::open(zenoh_config)
-            .res()
             .await
             .map_err(|e| eyre::eyre!("Failed to connect to Zenoh: {:?}", e))?,
     );
@@ -128,12 +126,10 @@ async fn main() -> eyre::Result<()> {
     // Subscribe to state updates
     let subscriber = session
         .declare_subscriber(state_topic)
-        .res()
         .await
         .map_err(|e| eyre::eyre!("Failed to subscribe: {:?}", e))?;
     let command_publisher = session
         .declare_publisher(command_topic)
-        .res()
         .await
         .map_err(|e| eyre::eyre!("Failed to create publisher: {:?}", e))?;
 
@@ -148,7 +144,7 @@ async fn main() -> eyre::Result<()> {
         loop {
             match subscriber.recv_async().await {
                 Ok(sample) => {
-                    let payload = sample.value.payload.contiguous();
+                    let payload = sample.payload().to_bytes();
                     match serde_json::from_slice::<GimbalState>(&payload) {
                         Ok(state) => {
                             *gimbal_state_clone.write().await = Some(state);
@@ -546,7 +542,6 @@ async fn send_command(publisher: &Publisher<'static>, yaw: f32, pitch: f32) -> e
     let json = serde_json::to_string(&cmd)?;
     publisher
         .put(json)
-        .res()
         .await
         .map_err(|e| eyre::eyre!("Failed to send command: {:?}", e))?;
     Ok(())
