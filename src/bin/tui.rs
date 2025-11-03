@@ -27,6 +27,8 @@ struct TuiState {
     pitch_target: f32,
     increment: f32,
     increment_index: usize,
+    corner_cycle_index: usize,
+    corner_cycle_origin: (f32, f32), // Store the origin when cycle starts
 }
 
 impl TuiState {
@@ -36,6 +38,8 @@ impl TuiState {
             pitch_target: 0.0,
             increment: 0.1,
             increment_index: 2,
+            corner_cycle_index: 0,
+            corner_cycle_origin: (0.0, 0.0),
         }
     }
 
@@ -47,6 +51,35 @@ impl TuiState {
         let increments = Self::get_increments();
         self.increment_index = (self.increment_index + 1) % increments.len();
         self.increment = increments[self.increment_index];
+    }
+
+    fn get_corner_offsets() -> [(f32, f32); 4] {
+        // (yaw_offset, pitch_offset) in radians
+        // 20 degrees = ~0.349 rad, 10 degrees = ~0.175 rad
+        let yaw_offset = 20.0_f32.to_radians();
+        let pitch_offset = 10.0_f32.to_radians();
+        [
+            (yaw_offset, pitch_offset),    // +20 yaw, +10 pitch
+            (-yaw_offset, pitch_offset),   // -20 yaw, +10 pitch
+            (yaw_offset, -pitch_offset),   // +20 yaw, -10 pitch
+            (-yaw_offset, -pitch_offset),  // -20 yaw, -10 pitch
+        ]
+    }
+
+    fn next_corner(&mut self) -> (f32, f32) {
+        let corners = Self::get_corner_offsets();
+        let (yaw_offset, pitch_offset) = corners[self.corner_cycle_index];
+        self.corner_cycle_index = (self.corner_cycle_index + 1) % corners.len();
+        
+        let new_yaw = self.corner_cycle_origin.0 + yaw_offset;
+        let new_pitch = self.corner_cycle_origin.1 + pitch_offset;
+        (new_yaw, new_pitch)
+    }
+
+    fn start_corner_cycle(&mut self) {
+        // Store current position as origin and reset cycle
+        self.corner_cycle_origin = (self.yaw_target, self.pitch_target);
+        self.corner_cycle_index = 0;
     }
 }
 
@@ -476,6 +509,15 @@ async fn run_tui(
                 ]),
                 Line::from(vec![
                     Span::styled(
+                        "X",
+                        Style::default()
+                            .fg(Color::Cyan)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::raw("    Cycle corners (±20°/±10° pattern)"),
+                ]),
+                Line::from(vec![
+                    Span::styled(
                         "Q/Esc",
                         Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
                     ),
@@ -524,6 +566,21 @@ async fn run_tui(
                             tui_state.pitch_target = 0.0;
                             send_command(&command_publisher, 0.0, 0.0).await?;
                             info!("Returning to zero");
+                        }
+                        KeyCode::Char('x') | KeyCode::Char('X') => {
+                            // First press starts the cycle from current position
+                            if tui_state.corner_cycle_index == 0 {
+                                tui_state.start_corner_cycle();
+                                info!("Starting corner cycle from yaw={:.3}, pitch={:.3}", 
+                                      tui_state.corner_cycle_origin.0, tui_state.corner_cycle_origin.1);
+                            }
+                            
+                            let (new_yaw, new_pitch) = tui_state.next_corner();
+                            tui_state.yaw_target = new_yaw;
+                            tui_state.pitch_target = new_pitch;
+                            send_command(&command_publisher, new_yaw, new_pitch).await?;
+                            info!("Corner cycle {}/4: yaw={:.3}, pitch={:.3}", 
+                                  tui_state.corner_cycle_index, new_yaw, new_pitch);
                         }
                         _ => {}
                     }
