@@ -305,8 +305,11 @@ async fn main() -> Result<()> {
 
     // Create Zenoh bridge
     let namespace = std::env::var("ZENOH_NAMESPACE").unwrap_or_else(|_| "gimbal".to_string());
-    let bridge = ZenohBridge::new(session.clone(), namespace, motor_states.clone()).await?;
+    let mut bridge = ZenohBridge::new(session.clone(), namespace, motor_states.clone()).await?;
     info!("Zenoh bridge created");
+    
+    // Extract command handler before moving bridge
+    let command_handler = std::mem::replace(&mut bridge.command_handler, tokio::spawn(async {}));
 
     // Spawn motor control loop (200Hz)
     let motor_states_clone = motor_states.clone();
@@ -363,7 +366,7 @@ async fn main() -> Result<()> {
     info!("Shutting down gracefully...");
 
     // Stop background tasks first
-    bridge.command_handler.abort();
+    command_handler.abort();
     motor_control_handle.abort();
     state_publish_handle.abort();
     
