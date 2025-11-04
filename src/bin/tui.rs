@@ -90,6 +90,8 @@ impl TuiState {
 struct GimbalState {
     pub yaw_position: f32,
     pub pitch_position: f32,
+    pub yaw_target: f32,
+    pub pitch_target: f32,
     pub yaw_velocity: f32,
     pub pitch_velocity: f32,
     pub yaw_torque: f32,

@@ -29,7 +29,6 @@ pub struct MotorState {
     pub command_count: u64,
     pub feedback_count: u64,
     pub motor_enabled: bool,
-    pub lock_mode: bool,
     pub available_actuators: Vec<u8>,
     #[serde(skip)]
     pub last_scan_time: Option<Instant>,
@@ -43,7 +42,6 @@ pub struct MotorState {
 pub enum MotorStates {
     IDLE,
     MOVING,
-    LOCKED,
     FAULT,
 }
 
@@ -66,7 +64,6 @@ impl MotorState {
             command_count: 0,
             feedback_count: 0,
             motor_enabled: false,
-            lock_mode: false,
             available_actuators: Vec::new(),
             last_scan_time: None,
             current_kp: 0.0,
@@ -82,10 +79,6 @@ impl MotorState {
 
     pub fn set_rel_position(&mut self, position_offset: f32) {
         self.target_position += position_offset;
-    }
-
-    pub fn toggle_lock_mode(&mut self) {
-        self.lock_mode = !self.lock_mode;
     }
 }
 
@@ -106,17 +99,6 @@ impl ControlPresets {
             kd: 8.0,
             max_torque: Some(150.0),
             max_velocity: Some(80.0),
-            max_current: Some(100.0),
-        }
-    }
-
-    /// Maximum stiffness configuration for lock mode
-    pub fn lock_mode() -> ControlConfig {
-        ControlConfig {
-            kp: 100.0,
-            kd: 10.0,
-            max_torque: Some(200.0),
-            max_velocity: Some(100.0),
             max_current: Some(100.0),
         }
     }
@@ -191,11 +173,6 @@ fn update_state_from_feedback(motor_state: &mut MotorState, feedback: &FeedbackF
                 motor_state.state = MotorStates::IDLE
             }
         },
-        MotorStates::LOCKED => {
-            if has_fault(feedback) {
-                motor_state.state = MotorStates::FAULT;
-            }
-        },
         MotorStates::FAULT => {
             if !has_fault(feedback) {
                 motor_state.state = MotorStates::IDLE;
@@ -221,26 +198,20 @@ pub async fn send_position_command(
     Ok(())
 }
 
-/// Apply control configuration based on lock mode
+/// Apply control configuration to motor
 pub async fn apply_control_config(
     supervisor: &mut Supervisor,
     motor_state: &mut MotorState,
     actuator_id: u8,
+    cfg: ControlConfig,
 ) -> Result<()> {
-    let cfg = if motor_state.lock_mode {
-        ControlPresets::lock_mode()
-    } else {
-        ControlPresets::normal_mode()
-    };
-
     supervisor.configure(actuator_id, cfg.clone()).await?;
     motor_state.current_kp = cfg.kp;
     motor_state.current_kd = cfg.kd;
     motor_state.current_max_torque = cfg.max_torque.unwrap_or(0.0);
 
     info!(
-        "Applied {} mode: kp={}, kd={}, max_torque={}",
-        if motor_state.lock_mode { "LOCK" } else { "NORMAL" },
+        "Applied control config: kp={}, kd={}, max_torque={}",
         cfg.kp,
         cfg.kd,
         cfg.max_torque.unwrap_or(0.0)

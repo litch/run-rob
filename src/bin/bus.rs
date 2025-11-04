@@ -1,10 +1,10 @@
 use anyhow::{Context, Result};
 use robstride::{
-    ActuatorConfiguration, ActuatorType, SocketCanTransport, Supervisor, TransportType,
+    ActuatorConfiguration, ActuatorType, ControlConfig, SocketCanTransport, Supervisor, TransportType,
     robstride00::RobStride00,
 };
 use run_rob::{
-    ControlPresets, MotorState, scan_actuators, send_position_command,
+    ControlPresets, MotorState, apply_control_config, scan_actuators, send_position_command,
     update_motor_state,
 };
 use serde::{Deserialize, Serialize};
@@ -19,6 +19,7 @@ use zenoh::{Session, sample::Sample};
 pub enum GimbalCoreCommand {
     Slew(SlewCommand),
     SlewRelative(SlewRelativeCommand),
+    SetControlConfig(SetControlConfigCommand),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -62,9 +63,33 @@ impl SlewRelativeCommand {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SetControlConfigCommand {
+    pub kp: f32,
+    pub kd: f32,
+    pub max_torque: Option<f32>,
+    pub max_velocity: Option<f32>,
+    pub max_current: Option<f32>,
+    pub timestamp_ms: u64,
+}
+
+impl SetControlConfigCommand {
+    pub fn to_control_config(&self) -> ControlConfig {
+        ControlConfig {
+            kp: self.kp,
+            kd: self.kd,
+            max_torque: self.max_torque,
+            max_velocity: self.max_velocity,
+            max_current: self.max_current,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GimbalState {
     pub yaw_position: f32,
     pub pitch_position: f32,
+    pub yaw_target: f32,
+    pub pitch_target: f32,
     pub yaw_velocity: f32,
     pub pitch_velocity: f32,
     pub yaw_torque: f32,
@@ -85,6 +110,9 @@ impl ZenohBridge {
         session: Arc<Session>,
         namespace: String,
         motor_states: Arc<RwLock<(MotorState, MotorState)>>,
+        supervisor: Supervisor,
+        yaw_motor_id: u8,
+        pitch_motor_id: u8,
     ) -> Result<Self> {
         let clean_namespace = namespace.trim_start_matches('/').to_string();
 
@@ -105,11 +133,18 @@ impl ZenohBridge {
 
         // Spawn command handler
         let motor_states_clone = motor_states.clone();
+        let mut supervisor_clone = supervisor.clone_controller();
         let command_handler = tokio::spawn(async move {
             loop {
                 match command_subscriber.recv_async().await {
                     Ok(sample) => {
-                        if let Err(e) = Self::handle_command(sample, motor_states_clone.clone()).await
+                        if let Err(e) = Self::handle_command(
+                            sample,
+                            motor_states_clone.clone(),
+                            &mut supervisor_clone,
+                            yaw_motor_id,
+                            pitch_motor_id,
+                        ).await
                         {
                             error!("Failed to handle command: {e}");
                         }
@@ -132,6 +167,9 @@ impl ZenohBridge {
     async fn handle_command(
         sample: Sample,
         motor_states: Arc<RwLock<(MotorState, MotorState)>>,
+        supervisor: &mut Supervisor,
+        yaw_motor_id: u8,
+        pitch_motor_id: u8,
     ) -> Result<()> {
         let payload = sample.payload().to_bytes();
         info!("Received command: {}", String::from_utf8_lossy(&payload));
@@ -155,6 +193,22 @@ impl ZenohBridge {
                 states.0.set_position(new_yaw);   // yaw motor
                 states.1.set_position(new_pitch); // pitch motor
             }
+            GimbalCoreCommand::SetControlConfig(config_cmd) => {
+                info!("Received control config: kp={:.1}, kd={:.1}, max_torque={:?}",
+                      config_cmd.kp, config_cmd.kd, config_cmd.max_torque);
+                let cfg = config_cmd.to_control_config();
+                let mut states = motor_states.write().await;
+                
+                // Apply to yaw motor
+                if let Err(e) = apply_control_config(supervisor, &mut states.0, yaw_motor_id, cfg.clone()).await {
+                    error!("Failed to apply config to yaw motor: {}", e);
+                }
+                
+                // Apply to pitch motor
+                if let Err(e) = apply_control_config(supervisor, &mut states.1, pitch_motor_id, cfg).await {
+                    error!("Failed to apply config to pitch motor: {}", e);
+                }
+            }
         }
 
         Ok(())
@@ -165,6 +219,8 @@ impl ZenohBridge {
         let state = GimbalState {
             yaw_position: states.0.current_position,
             pitch_position: states.1.current_position,
+            yaw_target: states.0.target_position,
+            pitch_target: states.1.target_position,
             yaw_velocity: states.0.current_velocity,
             pitch_velocity: states.1.current_velocity,
             yaw_torque: states.0.current_torque,
@@ -305,7 +361,15 @@ async fn main() -> Result<()> {
 
     // Create Zenoh bridge
     let namespace = std::env::var("ZENOH_NAMESPACE").unwrap_or_else(|_| "gimbal".to_string());
-    let mut bridge = ZenohBridge::new(session.clone(), namespace, motor_states.clone()).await?;
+    let supervisor_for_bridge = supervisor.clone_controller();
+    let mut bridge = ZenohBridge::new(
+        session.clone(),
+        namespace,
+        motor_states.clone(),
+        supervisor_for_bridge,
+        yaw_motor_id,
+        pitch_motor_id,
+    ).await?;
     info!("Zenoh bridge created");
     
     // Extract command handler before moving bridge
