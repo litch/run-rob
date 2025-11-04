@@ -98,6 +98,16 @@ struct GimbalState {
     pub pitch_torque: f32,
     pub yaw_temperature: f32,
     pub pitch_temperature: f32,
+    pub yaw_kp: f32,
+    pub yaw_kd: f32,
+    pub yaw_max_torque: f32,
+    pub yaw_max_velocity: f32,
+    pub yaw_max_current: f32,
+    pub pitch_kp: f32,
+    pub pitch_kd: f32,
+    pub pitch_max_torque: f32,
+    pub pitch_max_velocity: f32,
+    pub pitch_max_current: f32,
     pub timestamp_ms: u64,
 }
 

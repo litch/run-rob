@@ -96,6 +96,16 @@ pub struct GimbalState {
     pub pitch_torque: f32,
     pub yaw_temperature: f32,
     pub pitch_temperature: f32,
+    pub yaw_kp: f32,
+    pub yaw_kd: f32,
+    pub yaw_max_torque: f32,
+    pub yaw_max_velocity: f32,
+    pub yaw_max_current: f32,
+    pub pitch_kp: f32,
+    pub pitch_kd: f32,
+    pub pitch_max_torque: f32,
+    pub pitch_max_velocity: f32,
+    pub pitch_max_current: f32,
     pub timestamp_ms: u64,
 }
 
@@ -227,6 +237,16 @@ impl ZenohBridge {
             pitch_torque: states.1.current_torque,
             yaw_temperature: states.0.current_temperature,
             pitch_temperature: states.1.current_temperature,
+            yaw_kp: states.0.current_kp,
+            yaw_kd: states.0.current_kd,
+            yaw_max_torque: states.0.current_max_torque,
+            yaw_max_velocity: states.0.current_max_velocity,
+            yaw_max_current: states.0.current_max_current,
+            pitch_kp: states.1.current_kp,
+            pitch_kd: states.1.current_kd,
+            pitch_max_torque: states.1.current_max_torque,
+            pitch_max_velocity: states.1.current_max_velocity,
+            pitch_max_current: states.1.current_max_current,
             timestamp_ms: std::time::SystemTime::now()
                 .duration_since(std::time::SystemTime::UNIX_EPOCH)
                 .unwrap()

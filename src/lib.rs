@@ -35,6 +35,8 @@ pub struct MotorState {
     pub current_kp: f32,
     pub current_kd: f32,
     pub current_max_torque: f32,
+    pub current_max_velocity: f32,
+    pub current_max_current: f32,
     pub state: MotorStates,
 }
 
@@ -69,6 +71,8 @@ impl MotorState {
             current_kp: 0.0,
             current_kd: 0.0,
             current_max_torque: 0.0,
+            current_max_velocity: 0.0,
+            current_max_current: 0.0,
             state: MotorStates::IDLE,
         }
     }
@@ -209,12 +213,16 @@ pub async fn apply_control_config(
     motor_state.current_kp = cfg.kp;
     motor_state.current_kd = cfg.kd;
     motor_state.current_max_torque = cfg.max_torque.unwrap_or(0.0);
+    motor_state.current_max_velocity = cfg.max_velocity.unwrap_or(0.0);
+    motor_state.current_max_current = cfg.max_current.unwrap_or(0.0);
 
     info!(
-        "Applied control config: kp={}, kd={}, max_torque={}",
+        "Applied control config: kp={}, kd={}, max_torque={}, max_velocity={}, max_current={}",
         cfg.kp,
         cfg.kd,
-        cfg.max_torque.unwrap_or(0.0)
+        cfg.max_torque.unwrap_or(0.0),
+        cfg.max_velocity.unwrap_or(0.0),
+        cfg.max_current.unwrap_or(0.0)
     );
 
     Ok(())
